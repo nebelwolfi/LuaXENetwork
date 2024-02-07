@@ -1,0 +1,3 @@
+LIBRARY   LuaNetworkBinding
+EXPORTS
+   luaopen_network  @1
