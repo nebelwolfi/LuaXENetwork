@@ -1,0 +1,7 @@
+{
+    "name": "network",
+    "type": "dll",
+    "files": [
+        "network.dll"
+    ]
+}

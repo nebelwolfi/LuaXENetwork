@@ -8,7 +8,13 @@ include_directories(Dependencies\\Include\\)
 include_directories(C:\\LuaJIT-2.1.M.64\\src)
 include_directories(D:\\LuaBindingGit\\)
 
-add_library(LuaNetworkBinding SHARED main.cpp dll.def)
+file(GLOB_RECURSE connection connection/*.cpp connection/*.h)
+file(GLOB_RECURSE misc misc/*.cpp misc/*.h)
+file(GLOB_RECURSE socket socket/*.cpp socket/*.h)
+file(GLOB_RECURSE websocketpp websocketpp/*.cpp websocketpp/*.h)
+
+add_library(LuaNetworkBinding SHARED main.cpp dll.def ${connection} ${misc} ${socket} ${websocketpp}
+        pch.h)
 
 find_library(LUAJ5164_3 lua51 lib C:\\LuaJIT-2.1.M.64\\src\\)
 

@@ -57,9 +57,12 @@ public:
 
 class SocketServer : public Socket {
 public:
-	SocketServer(int port, int connections, TypeSocket type = BlockingSocket);
+	SocketServer(TypeSocket type = BlockingSocket);
 
 	Socket* Accept();
+
+    int port_;
+    bool stop = false;
 };
 
 class SocketSelect {

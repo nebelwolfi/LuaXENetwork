@@ -132,14 +132,13 @@ void Socket::SendBytes(const std::string& s) {
 	send(s_, s.c_str(), s.length(), 0);
 }
 
-SocketServer::SocketServer(int port, int connections, TypeSocket type) {
+SocketServer::SocketServer(TypeSocket type) {
 	sockaddr_in sa;
-	
 
 	memset(&sa, 0, sizeof(sa));
 
 	sa.sin_family = PF_INET;
-	sa.sin_port = htons(port);
+	sa.sin_port = htons(0);
 	s_ = socket(AF_INET, SOCK_STREAM, 0);
 	if (s_ == INVALID_SOCKET) {
 		throw "INVALID_SOCKET";
@@ -158,7 +157,14 @@ SocketServer::SocketServer(int port, int connections, TypeSocket type) {
 		throw "INVALID_SOCKET";
 	}
 
-	listen(s_, connections);
+	listen(s_, SOMAXCONN);
+
+    // find out which port was really used
+    int sa_len = sizeof(sa);
+    if (getsockname(s_, (sockaddr*)&sa, &sa_len) == -1) {
+        throw "INVALID_SOCKET";
+    }
+    port_ = ntohs(sa.sin_port);
 }
 
 Socket* SocketServer::Accept() {
