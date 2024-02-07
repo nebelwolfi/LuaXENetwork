@@ -132,13 +132,13 @@ void Socket::SendBytes(const std::string& s) {
 	send(s_, s.c_str(), s.length(), 0);
 }
 
-SocketServer::SocketServer(TypeSocket type) {
+SocketServer::SocketServer(int port, TypeSocket type) {
 	sockaddr_in sa;
 
 	memset(&sa, 0, sizeof(sa));
 
 	sa.sin_family = PF_INET;
-	sa.sin_port = htons(0);
+	sa.sin_port = htons(port);
 	s_ = socket(AF_INET, SOCK_STREAM, 0);
 	if (s_ == INVALID_SOCKET) {
 		throw "INVALID_SOCKET";

@@ -346,8 +346,9 @@ static int WebRequest_SimpleDownload(lua_State *L) {
 }
 
 int Listener_Create(lua_State *L) {
+    int port = lua_tointeger(L, 1);
     LuaBinding::State S(L);
-    S.alloc<SocketServer>();
+    S.alloc<SocketServer>(port, BlockingSocket);
     return 1;
 }
 
@@ -367,6 +368,21 @@ int Listener_Accept(lua_State *L) {
                 lua_newtable(L);
                 lua_pushstring(L, CurrentReceive.c_str());
                 lua_setfield(L, -2, "request");
+                lua_pushcfunction(L, +[](lua_State*L) -> int {
+                    if (lua_istable(L, 1)) {
+                        std::string ReturnData = ResponseBuilder(L, 1);
+                        lua_pushstring(L, ReturnData.c_str());
+                        return 1;
+                    } else if (lua_isstring(L, 1)) {
+                        std::string ReturnData = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(lua_objlen(L, 1)) + "\r\n\r\n" + lua_tostring(L, 1);
+                        lua_pushstring(L, ReturnData.c_str());
+                        return 1;
+                    } else {
+                        lua_pushstring(L, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+                        return 1;
+                    }
+                });
+                lua_setfield(L, -2, "build");
                 if (LuaBinding::pcall(L, 1, 1)) {
                     sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
                     delete sock;
@@ -377,8 +393,7 @@ int Listener_Accept(lua_State *L) {
                     std::string ReturnData = ResponseBuilder(L, -1);
                     sock->SendBytes(ReturnData);
                 } else if (lua_isstring(L, -1)) {
-                    std::string ReturnData = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(lua_objlen(L, -1)) + "\r\n\r\n" + lua_tostring(L, -1);
-                    sock->SendBytes(ReturnData);
+                    sock->SendBytes(lua_tostring(L, -1));
                 } else {
                     sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
                 }
