@@ -4,6 +4,7 @@
 #include "socket/framework.h"
 #include "socket/Utilities.h"
 #include "socket/ActiveSock.h"
+#include "socket/Socket.h"
 #include "socket/SSLClient.h"
 #include "socket/EventWrapper.h"
 #include "socket/CertHelper.h"
@@ -13,17 +14,21 @@
 
 #include <codecvt>
 #include "misc/md5.h"
-#include "connection/Socket.h"
+#include <memory>
 #include <thread>
 #include <chrono>
 #include <shellapi.h>
 #include "misc/json.hpp"
+#include "misc/ping.h"
 #include <mutex>
 #include <future>
 #include <filesystem>
 
-std::string RequestBuilder(lua_State *L, int idx = 1) {
+env* _env = nullptr;
+
+std::string RequestBuilder(lua_State *L, std::string host, int idx = -1) {
     idx = lua_absindex(L, idx);
+    if (lua_isstring(L, idx)) return lua_tostring(L, idx);
     std::string request;
     if (luaL_getfield(L, idx, "method") == LUA_TSTRING) {
         request += lua_tostring(L, -1);
@@ -31,26 +36,22 @@ std::string RequestBuilder(lua_State *L, int idx = 1) {
     } else {
         request += "GET ";
     }
+    lua_pop(L, 1);
     if (luaL_getfield(L, idx, "path") == LUA_TSTRING) {
         request += lua_tostring(L, -1);
         if (!request.empty()) request += " ";
     } else {
         request += "/ ";
     }
+    lua_pop(L, 1);
     if (luaL_getfield(L, idx, "version") == LUA_TSTRING) {
         request += lua_tostring(L, -1);
         request += "\r\n";
     } else {
         request += "HTTP/1.1\r\n";
     }
-    if (luaL_getfield(L, idx, "accept") == LUA_TSTRING) {
-        request += "Accept: ";
-        request += lua_tostring(L, -1);
-        request += "\r\n";
-    } else {
-        request += "Accept: */*\r\n";
-    }
-    if (luaL_getfield(L, idx, "headers") == LUA_TTABLE) {
+    lua_pop(L, 1);
+    if (auto header_type = luaL_getfield(L, idx, "headers"); header_type == LUA_TTABLE) {
         lua_pushnil(L);
         while (lua_next(L, -2) != 0) {
             request += lua_tostring(L, -2);
@@ -59,7 +60,14 @@ std::string RequestBuilder(lua_State *L, int idx = 1) {
             request += "\r\n";
             lua_pop(L, 1);
         }
+    } else if (header_type == LUA_TSTRING) {
+        request += lua_tostring(L, -1);
+        request += "\r\n";
+    } else {
+        request += "Accept: */*\r\n";
     }
+    lua_pop(L, 1);
+    request += "Host: " + host + "\r\n";
     if (luaL_getfield(L, idx, "body") == LUA_TSTRING) {
         request += "Content-Length: ";
         request += std::to_string(lua_objlen(L, -1));
@@ -68,6 +76,7 @@ std::string RequestBuilder(lua_State *L, int idx = 1) {
     } else {
         request += "\r\n";
     }
+    lua_pop(L, 1);
     return request;
 }
 
@@ -76,16 +85,21 @@ std::string ResponseBuilder(lua_State *L, int idx = 1) {
     std::string request;
     if (luaL_getfield(L, idx, "version") == LUA_TSTRING) {
         request += lua_tostring(L, -1);
-        request += "\r\n";
+        request += " ";
     } else {
-        request += "HTTP/1.1 200 OK\r\n";
+        request += "HTTP/1.1 ";
     }
-    if (luaL_getfield(L, idx, "accept") == LUA_TSTRING) {
-        request += "Accept: ";
+    if (luaL_getfield(L, idx, "status") == LUA_TNUMBER) {
+        request += std::to_string(lua_tointeger(L, -1));
+        request += " ";
+    } else {
+        request += "200 ";
+    }
+    if (luaL_getfield(L, idx, "reason") == LUA_TSTRING) {
         request += lua_tostring(L, -1);
         request += "\r\n";
     } else {
-        request += "Accept: */*\r\n";
+        request += "OK\r\n";
     }
     if (luaL_getfield(L, idx, "headers") == LUA_TTABLE) {
         lua_pushnil(L);
@@ -153,15 +167,20 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         luaL_error(L, "Could not connect to the Server");
         return "";
     }
-    auto pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
-    pSSLClient->ServerCertAcceptable = CertAcceptable;
-    pSSLClient->SelectClientCertificate = SelectClientCertificate;
-    HRESULT hr = pSSLClient->Initialize(HostW.c_str());
-    if (!SUCCEEDED(hr)) {
-        luaL_error(L, "Failed to Init SSL %llX", hr);
-        return "";
+    std::unique_ptr<CSSLClient> pSSLClient;
+    if (Port == 443)
+    {
+        pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
+        pSSLClient->ServerCertAcceptable = CertAcceptable;
+        pSSLClient->SelectClientCertificate = SelectClientCertificate;
+        HRESULT hr = pSSLClient->Initialize(HostW.c_str());
+        if (SUCCEEDED(hr)) {
+            pSSLClient->Send(RequestString.c_str(), RequestString.size());
+        } else
+            pActiveSock->Send(RequestString.c_str(), RequestString.size());
+    } else {
+        pActiveSock->Send(RequestString.c_str(), RequestString.size());
     }
-    pSSLClient->Send(RequestString.c_str(), RequestString.size());
 
     int BufferBytesReceiving = 4096;
     int ContentLength = 0;
@@ -180,8 +199,12 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         ReceiveMsgBuffer.resize(BufferBytesReceiving);
         ReceiveMsgBuffer.reserve(BufferBytesReceiving);
         int BytesReceived = 0;
+        int res = 0;
 
-        int res = (BytesReceived = pSSLClient->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
+        if (pSSLClient)
+            res = (BytesReceived = pSSLClient->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
+        else
+            res = (BytesReceived = pActiveSock->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
         if (0 < res) {
             std::string ReceiveMsg = ReceiveMsgBuffer.substr(0, BytesReceived);
             CompleteReceive += ReceiveMsg;
@@ -223,12 +246,12 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         }
         else if (res == 0)
         {
-            luaL_error(L, "Connection closed by server");
+            //luaL_error(L, "Connection closed by server");
             RequestFinished = true;
         }
         else
         {
-            luaL_error(L, "Error receiving data");
+            luaL_error(L, "Error receiving data: %d", WSAGetLastError());
             RequestFinished = true;
         }
     }
@@ -237,17 +260,18 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         return "";
     }
     if (Body.empty()) {
-        luaL_error(L, "No Body received");
-        return "";
+        //luaL_error(L, "No Body received");
+        return CompleteReceive;
     }
     return Body;
 }
 
 static int WebRequest(lua_State *L) {
+    if (lua_isnoneornil(L, 2)) lua_newtable(L);
     std::string HostA;
     std::wstring HostW;
     int Port = 443;
-    if (lua_isstring(L, 1)) {
+    if (lua_isstring(L, 1) && lua_gettop(L) > 1) {
         HostA = lua_tostring(L, 1);
         HostW = std::wstring(HostA.begin(), HostA.end());
         if (lua_isnumber(L, 2)) {
@@ -256,24 +280,27 @@ static int WebRequest(lua_State *L) {
             if (luaL_getfield(L, 2, "port") == LUA_TNUMBER) {
                 Port = lua_tointeger(L, -1);
             }
+            lua_pop(L, 1);
         }
     } else if (lua_istable(L, 1)) {
         if (luaL_getfield(L, 1, "host") == LUA_TSTRING) {
             HostA = lua_tostring(L, -1);
             HostW = utf8_decode(HostA);
         } else {
-            luaL_error(L, "Host is not a string");
+            luaL_error(L, "request.host is not a string");
             return 0;
         }
+        lua_pop(L, 1);
         if (luaL_getfield(L, 1, "port") == LUA_TNUMBER) {
             Port = lua_tointeger(L, -1);
         }
+        lua_pop(L, 1);
     } else {
-        luaL_error(L, "Host is not a string");
+        luaL_error(L, "missing 'host' parameter");
         return 0;
     }
 
-    std::string RequestString = RequestBuilder(L);
+    std::string RequestString = RequestBuilder(L, HostA);
     std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString);
     lua_pushstring(L, Response.c_str());
     return 1;
@@ -348,86 +375,528 @@ static int WebRequest_SimpleDownload(lua_State *L) {
 int Listener_Create(lua_State *L) {
     int port = lua_tointeger(L, 1);
     LuaBinding::State S(L);
-    S.alloc<SocketServer>(port, BlockingSocket);
+    S.alloc<SocketServer>(port, lua_toboolean(L, 2) ? NonBlockingSocket : BlockingSocket);
     return 1;
+}
+
+class ListenerContext {
+private:
+    std::unique_ptr<Socket> sock;
+    std::string recv_buffer;
+public:
+    int onError = LUA_REFNIL;
+    lua_State * onErrState = nullptr;
+    ~ListenerContext() {
+        if (onError != LUA_REFNIL)
+            luaL_unref(onErrState, LUA_REGISTRYINDEX, onError);
+    }
+
+    void Accept(std::unique_ptr<Socket> s) {
+        sock = std::move(s);
+    }
+
+    static int lua_Build(LuaBinding::State L) {
+        if (L.at(1).is<ListenerContext>()) lua_remove(L, 1);
+        if (lua_istable(L, 1)) {
+            std::string ReturnData = ResponseBuilder(L, 1);
+            lua_pushstring(L, ReturnData.c_str());
+            return 1;
+        } else if (lua_isstring(L, 1)) {
+            std::string ReturnData = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(lua_objlen(L, 1)) + "\r\n\r\n" + lua_tostring(L, 1);
+            lua_pushstring(L, ReturnData.c_str());
+            return 1;
+        } else {
+            lua_pushstring(L, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+            return 1;
+        }
+    }
+
+    int lua_Error(LuaBinding::State L) {
+        if (L.at(1).is<ListenerContext>()) lua_remove(L, 1);
+        if (onError != LUA_REFNIL)
+            luaL_unref(L, LUA_REGISTRYINDEX, onError);
+        if (lua_isnoneornil(L, 1)) {
+            onError = LUA_REFNIL;
+            return 0;
+        }
+        onError = luaL_ref(L, LUA_REGISTRYINDEX);
+        onErrState = L;
+        return 0;
+    }
+
+    bool closed() {
+        return sock->Closed();
+    }
+    void close() {
+        sock->Close();
+    }
+    auto GetRemote() { return sock->GetRemote(); }
+    auto GetLocal() { return sock->GetLocal(); }
+    auto ReceiveBytes(unsigned long len) { return sock->ReceiveBytes(len); }
+    auto SendBytes(std::string&& s) { return sock->SendBytes(std::move(s)); }
+
+    int lua_Send(lua_State *L) {
+        LuaBinding::State S(L);
+        if (lua_isstring(L, 2)) {
+            size_t len;
+            S.push(sock->SendBytes({ lua_tolstring(L, 2, &len), len }));
+        } else if (lua_istable(L, 2)) {
+            S.push(sock->SendBytes(ResponseBuilder(L, 2)));
+        } else {
+            luaL_error(L, "Invalid argument");
+        }
+        return 1;
+    }
+
+    int lua_Request(lua_State *L) {
+        if (recv_buffer.empty())
+            recv_buffer = ReceiveBytes(0);
+        if (recv_buffer.empty())
+            return 0;
+        lua_newtable(L);
+        lua_pushstring(L, recv_buffer.c_str());
+        lua_setfield(L, -2, "data");
+        std::string method = recv_buffer.substr(0, recv_buffer.find(' '));
+        lua_pushstring(L, method.c_str());
+        lua_setfield(L, -2, "method");
+        std::string path = recv_buffer.substr(recv_buffer.find(' ') + 1, recv_buffer.find(' ', recv_buffer.find(' ') + 1) - recv_buffer.find(' ') - 1);
+        if (path.find('?') != std::string::npos) {
+            auto query = path.substr(path.find('?') + 1);
+            lua_pushstring(L, query.c_str());
+            lua_setfield(L, -2, "query");
+            path = path.substr(0, path.find('?'));
+        }
+        lua_pushstring(L, path.c_str());
+        lua_setfield(L, -2, "path");
+        std::string version = recv_buffer.substr(recv_buffer.find(' ', recv_buffer.find(' ') + 1) + 1, recv_buffer.find("\r\n") - recv_buffer.find(' ', recv_buffer.find(' ') + 1) - 1);
+        lua_pushstring(L, version.c_str());
+        lua_setfield(L, -2, "version");
+        std::string headers = recv_buffer.substr(recv_buffer.find("\r\n") + 2, recv_buffer.find("\r\n\r\n") - recv_buffer.find("\r\n") - 2);
+        lua_newtable(L);
+        int i = 1;
+        while (headers.find("\r\n") != std::string::npos) {
+            std::string header = headers.substr(0, headers.find("\r\n"));
+            lua_pushstring(L, header.c_str());
+            lua_rawseti(L, -2, i);
+            headers = headers.substr(headers.find("\r\n") + 2);
+            i++;
+        }
+        lua_setfield(L, -2, "headers");
+        std::string body = recv_buffer.substr(recv_buffer.find("\r\n\r\n") + 4);
+        lua_pushstring(L, body.c_str());
+        lua_setfield(L, -2, "body");
+        return 1;
+    }
+};
+
+class ConnectionContext {
+private:
+    CEventWrapper ShutDownEvent;
+    std::unique_ptr<CActiveSock> pActiveSock;
+    std::unique_ptr<CSSLClient> pSSLClient;
+public:
+    ConnectionContext(LuaBinding::State S) {
+        auto L = S.lua_state();
+        std::string HostA;
+        std::wstring HostW;
+        int Port = 443;
+        bool block = true;
+        if (lua_isstring(L, 1) && lua_gettop(L) > 1) {
+            HostA = lua_tostring(L, 1);
+            HostW = std::wstring(HostA.begin(), HostA.end());
+            if (lua_isnumber(L, 2)) {
+                Port = lua_tointeger(L, 2);
+                block = lua_toboolean(L, 3);
+            } else if (lua_istable(L, 2)) {
+                if (luaL_getfield(L, 2, "port") == LUA_TNUMBER) {
+                    Port = lua_tointeger(L, -1);
+                }
+                lua_pop(L, 1);
+                if (luaL_getfield(L, 2, "block") == LUA_TBOOLEAN) {
+                    block = lua_toboolean(L, -1);
+                }
+                lua_pop(L, 1);
+            } else if (lua_isboolean(L, 2)) {
+                block = lua_toboolean(L, 2);
+            }
+        } else if (lua_istable(L, 1)) {
+            if (luaL_getfield(L, 1, "host") == LUA_TSTRING) {
+                HostA = lua_tostring(L, -1);
+                HostW = utf8_decode(HostA);
+            } else {
+                luaL_error(L, "request.host is not a string");
+                return;
+            }
+            lua_pop(L, 1);
+            if (luaL_getfield(L, 1, "port") == LUA_TNUMBER) {
+                Port = lua_tointeger(L, -1);
+            }
+            lua_pop(L, 1);
+            if (luaL_getfield(L, 1, "block") == LUA_TBOOLEAN) {
+                block = lua_toboolean(L, -1);
+            }
+            lua_pop(L, 1);
+        } else {
+            luaL_error(L, "missing 'host' parameter");
+            return;
+        }
+
+        pActiveSock = std::make_unique<CActiveSock>(ShutDownEvent);
+
+        if (!block) {
+            u_long arg = 1;
+            ioctlsocket(pActiveSock->ActualSocket, FIONBIO, &arg);
+
+            int rc = 1;
+            setsockopt(pActiveSock->ActualSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&rc, sizeof(int));
+        }
+
+        bool b = pActiveSock->Connect(HostW.c_str(), static_cast<USHORT>(Port));
+        if (!b) {
+            luaL_error(L, "Could not connect to the Server");
+            return;
+        }
+        if (Port == 443)
+        {
+            pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
+            pSSLClient->ServerCertAcceptable = CertAcceptable;
+            pSSLClient->SelectClientCertificate = SelectClientCertificate;
+            HRESULT hr = pSSLClient->Initialize(HostW.c_str());
+            if (!SUCCEEDED(hr))
+                luaL_error(L, "Failed to initialize SSL");
+        }
+    }
+    bool closed() {
+        return pActiveSock->Closed();
+    }
+    void close() {
+        pActiveSock->Disconnect();
+    }
+    auto GetRemote() { return pActiveSock->GetRemote(); }
+    auto GetPort() {
+        sockaddr_storage s = pActiveSock->GetLocal();
+        if (s.ss_family == AF_INET) {
+            auto sa = (sockaddr_in*)&s;
+            return ntohs(sa->sin_port);
+        } else {
+            auto sa = (sockaddr_in6*)&s;
+            return ntohs(sa->sin6_port);
+        }
+    }
+    auto ReceiveBytes(unsigned long len) {
+        std::string buffer;
+        if (!len) {
+            buffer.resize(1024);
+            if (pSSLClient)
+                pSSLClient->Recv(&buffer[0], 1024);
+            else
+                pActiveSock->Recv(&buffer[0], 1024);
+        } else {
+            buffer.resize(len);
+            if (pSSLClient)
+                pSSLClient->Recv(&buffer[0], len, len);
+            else
+                pActiveSock->Recv(&buffer[0], len, len);
+        }
+        return buffer;
+    }
+    auto SendBytes(const std::string& s) {
+        if (pSSLClient)
+            return pSSLClient->Send(s.c_str(), s.size());
+        else
+            return pActiveSock->Send(s.c_str(), s.size());
+    }
+
+    int lua_Send(lua_State *L) {
+        LuaBinding::State S(L);
+        auto s = S.at(1).as<ConnectionContext*>();
+        if (lua_isstring(L, 2)) {
+            s->SendBytes(lua_tostring(L, 2));
+        } else if (lua_istable(L, 2)) {
+            std::string r = ResponseBuilder(L, 2);
+            s->SendBytes(r);
+        } else {
+            luaL_error(L, "Invalid argument");
+        }
+        return 0;
+    }
+
+    int lua_Poll(lua_State *L) {
+        if (lua_gettop(L) > 1) {
+            unsigned long want_recv = lua_tointeger(L, 2);
+            unsigned long can_recv = 0;
+            int ctl = ioctlsocket(pActiveSock->ActualSocket, FIONREAD, &can_recv);
+            if (ctl == SOCKET_ERROR) {
+                luaL_error(L, "Failed to poll socket: %d", WSAGetLastError());
+                return 0;
+            }
+            if (can_recv >= want_recv) {
+                lua_pushboolean(L, true);
+                return 1;
+            }
+            if (can_recv > 0) {
+                std::string buffer;
+                buffer.reserve(want_recv);
+                int rc = recv(pActiveSock->ActualSocket, buffer.data(), buffer.size(), MSG_PEEK);
+                if (rc == SOCKET_ERROR) {
+                    luaL_error(L, "Failed to poll socket: %d", WSAGetLastError());
+                    return 0;
+                }
+                lua_pushboolean(L, true);
+                return 1;
+            }
+            lua_pushboolean(L, false);
+            return 1;
+        } else {
+            unsigned long max_recv = 0;
+            int ctl = ioctlsocket(pActiveSock->ActualSocket, FIONREAD, &max_recv);
+            if (ctl == SOCKET_ERROR) {
+                luaL_error(L, "Failed to poll socket: %d", WSAGetLastError());
+                return 0;
+            }
+            if (max_recv > 0) {
+                int rc = recv(pActiveSock->ActualSocket, nullptr, 0, MSG_PEEK);
+                if (rc == SOCKET_ERROR) {
+                    luaL_error(L, "Failed to poll socket: %d", WSAGetLastError());
+                    return 0;
+                }
+                lua_pushinteger(L, rc);
+                return 1;
+            }
+            lua_pushinteger(L, max_recv);
+            return 1;
+        }
+    }
+};
+
+int Connection_Create(lua_State *L) {
+    LuaBinding::State S(L);
+    S.alloc<ConnectionContext>(S);
+    return 1;
+}
+
+int lua_networkclasses(lua_State* L);
+
+void Listener_AsyncRun(std::unique_ptr<ListenerContext> sock, const std::string&& func) {
+    auto state = _env->new_state();
+    auto L = state->lua_state();
+    lua_networkclasses(L);
+    if (luaL_loadbuffer(L, func.data(), func.size(), "=thread")) {
+        luaL_error(L, "Failed to load thread: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_insert(L, 1);
+    state->push(sock.get());
+    if (LuaBinding::pcall(L, 1, LUA_MULTRET) != LUA_OK)
+    {
+        if (sock->onError != LUA_REFNIL) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, sock->onError);
+            lua_pushvalue(L, -2);
+            if (LuaBinding::pcall(L, 1, LUA_MULTRET)) {
+                luaL_error(L, "Failed to execute error function: %s", lua_tostring(L, -1));
+                lua_pop(L, 1);
+            }
+        } else {
+            luaL_error(L, "Failed to execute listener function: %s", lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+    }
+    if (lua_gettop(L) > 0) {
+        // lua stack:
+        // [1] = socketserver
+        // [2] = result
+        if (lua_istable(L, -1)) {
+            sock->SendBytes(ResponseBuilder(L, -1));
+        } else if (lua_isstring(L, -1)) {
+            size_t len;
+            sock->SendBytes({ lua_tolstring(L, -1, &len), len });
+        } else {
+            sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        }
+    }
 }
 
 int Listener_Accept(lua_State *L) {
     LuaBinding::State S(L);
     auto s = S.at(1).as<SocketServer*>();
-    Socket* sock = s->Accept();
+    if (lua_isnoneornil(L, 2) || !lua_isfunction(L, 2) && !lua_istable(L, 2) && !lua_isuserdata(L, 2)) {
+        if (lua_rawgetp(L, LUA_REGISTRYINDEX, s) != LUA_TNIL) {
+            size_t len;
+            std::string buffer = { lua_tolstring(L, -1, &len), len };
+            lua_pop(L, 1);
+            auto sock = std::make_unique<ListenerContext>();
+            sock->Accept(s->Accept());
+            std::thread(Listener_AsyncRun, std::move(sock), std::move(buffer)).detach();
+            return 0;
+        }
+        luaL_error(L, "No function provided");
+        return 0;
+    }
+    // lua stack:
+    // [1] = socketserver
+    // [2] = func(sock)
 
-    std::string CurrentReceive = "";
-    while (!s->stop) {
-        std::string Receive = sock->ReceiveLine();
-        if (Receive.empty()) break;
-        if (Receive.size() > 0) {
-            CurrentReceive += Receive;
-            if (CurrentReceive.substr(CurrentReceive.size() - 4) == "\r\n\r\n") {
-                lua_pushvalue(L, 2);
-                lua_newtable(L);
-                lua_pushstring(L, CurrentReceive.c_str());
-                lua_setfield(L, -2, "request");
-                lua_pushcfunction(L, +[](lua_State*L) -> int {
-                    if (lua_istable(L, 1)) {
-                        std::string ReturnData = ResponseBuilder(L, 1);
-                        lua_pushstring(L, ReturnData.c_str());
-                        return 1;
-                    } else if (lua_isstring(L, 1)) {
-                        std::string ReturnData = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(lua_objlen(L, 1)) + "\r\n\r\n" + lua_tostring(L, 1);
-                        lua_pushstring(L, ReturnData.c_str());
-                        return 1;
-                    } else {
-                        lua_pushstring(L, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
-                        return 1;
-                    }
-                });
-                lua_setfield(L, -2, "build");
-                if (LuaBinding::pcall(L, 1, 1)) {
-                    sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
-                    delete sock;
-                    luaL_error(L, "Failed to execute listener function: %s", lua_tostring(L, -1));
-                    return 0;
-                }
-                if (lua_istable(L, -1)) {
-                    std::string ReturnData = ResponseBuilder(L, -1);
-                    sock->SendBytes(ReturnData);
-                } else if (lua_isstring(L, -1)) {
-                    sock->SendBytes(lua_tostring(L, -1));
-                } else {
-                    sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
-                }
-                lua_pop(L, 1);
-                CurrentReceive.clear();
+    auto usock = s->Accept();
+    if (!usock) {
+        if (s->type_ == BlockingSocket)
+            luaL_error(L, "Failed to accept connection");
+        return 0;
+    }
+
+    // [3] = socket
+    auto sock = S.alloc<ListenerContext>();
+    sock->Accept(std::move(usock));
+
+    if (LuaBinding::pcall(L, 1, LUA_MULTRET)) {
+        if (sock->onError != LUA_REFNIL) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, sock->onError);
+            lua_pushvalue(L, -2);
+            if (LuaBinding::pcall(L, 1, LUA_MULTRET)) {
+                luaL_error(L, "Failed to execute error function: %s", lua_tostring(L, -1));
+                return 0;
             }
+        } else {
+            luaL_error(L, "Failed to execute listener function: %s", lua_tostring(L, -1));
+            return 0;
         }
     }
-    delete sock;
+
+    if (lua_gettop(L) > 1) {
+        // lua stack:
+        // [1] = socketserver
+        // [2] = result
+        if (lua_istable(L, -1)) {
+            sock->SendBytes(ResponseBuilder(L, -1));
+        } else if (lua_isstring(L, -1)) {
+            size_t len;
+            sock->SendBytes({ lua_tolstring(L, -1, &len), len });
+        } else {
+            sock->SendBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        }
+        sock->close();
+    }
+
     return 0;
 }
 
-int Listener_Stop(lua_State *L) {
+int Listener_AcceptAsync(lua_State *L) {
+    if (lua_isnoneornil(L, 2) || !lua_isfunction(L, 2) && !lua_istable(L, 2) && !lua_isuserdata(L, 2)) {
+        luaL_error(L, "No function provided");
+        return 0;
+    }
+
     LuaBinding::State S(L);
     auto s = S.at(1).as<SocketServer*>();
-    s->stop = true;
+
+    luaL_checktype(L, -1, LUA_TFUNCTION);
+    luaL_Buffer buf;
+    luaL_buffinit(L, &buf);
+
+    //printf("Dumping function %llX (%d, %llX)\n", s, lua_gettop(L), L);
+    if (lua_dump(L, (lua_Writer)+[](lua_State* L, unsigned char* str, size_t len, struct luaL_Buffer* buf) {
+            //printf("adding %d bytes to %llX (in %llX)... %d,%d,%d ... ", len, buf, buf->L, lua_gettop(buf->L), buf->lvl, buf->p - buf->buffer);
+            luaL_addlstring(buf, (const char*)str, len);
+            //printf("done\n");
+            return 0;
+        }, &buf) != LUA_OK) {
+        //printf("Failed to dump function: %s\n", lua_tostring(L, -1));
+        luaL_error(L, "Unable to transfer function: %s", lua_tostring(L, -1));
+    }
+    luaL_pushresult(&buf);
+
+    lua_rawsetp(L, LUA_REGISTRYINDEX, s);
+
+    return 0;
+}
+
+int lua_networkclasses(lua_State* L) {
+    LuaBinding::State S(L);
+    auto sasc = S.addClass<sockaddr_storage>("sockaddr_storage");
+    sasc.prop_fun("ip", [](sockaddr_storage* s) -> std::string {
+        char ip[INET6_ADDRSTRLEN];
+        if (s->ss_family == AF_INET) {
+            auto sa = (sockaddr_in*)s;
+            inet_ntop(AF_INET, &sa->sin_addr, ip, INET_ADDRSTRLEN);
+        } else {
+            auto sa = (sockaddr_in6*)s;
+            inet_ntop(AF_INET6, &sa->sin6_addr, ip, INET6_ADDRSTRLEN);
+        }
+        return ip;
+    });
+    sasc.prop_fun("port", [](sockaddr_storage* s) -> int {
+        if (s->ss_family == AF_INET) {
+            auto sa = (sockaddr_in*)s;
+            return ntohs(sa->sin_port);
+        } else {
+            auto sa = (sockaddr_in6*)s;
+            return ntohs(sa->sin6_port);
+        }
+    });
+
+    auto lc = S.addClass<ListenerContext>("ListenerContext");
+    lc.prop_fun("remote", &ListenerContext::GetRemote);
+    lc.prop_fun("listener", &ListenerContext::GetLocal);
+    lc.prop_fun("closed", &ListenerContext::closed);
+    lc.fun("close", &ListenerContext::close);
+    lc.fun("receive", &ListenerContext::ReceiveBytes);
+    lc.cfun("send", &ListenerContext::lua_Send);
+    lc.prop_cfun("request", &ListenerContext::lua_Request);
+    lc.cfun("build", &ListenerContext::lua_Build);
+    lc.cfun("error", &ListenerContext::lua_Error);
+
+    auto ssc = S.addClass<SocketServer>("SocketServer");
+    ssc.prop("port", &SocketServer::port_);
+    ssc.cfun("accept", &Listener_Accept);
+    ssc.cfun("async", &Listener_AcceptAsync);
+
+    auto cc = S.addClass<ConnectionContext>("ConnectionContext");
+    cc.prop_fun("remote", &ConnectionContext::GetRemote);
+    cc.prop_fun("port", &ConnectionContext::GetPort);
+    cc.prop_fun("closed", &ConnectionContext::closed);
+    cc.fun("close", &ConnectionContext::close);
+    cc.fun("receive", &ConnectionContext::ReceiveBytes);
+    cc.cfun("send", &ConnectionContext::lua_Send);
+    cc.cfun("poll", &ConnectionContext::lua_Poll);
+
     return 0;
 }
 
 int luaopen_network(lua_State* L) {
-    LuaBinding::State S(L);
-    auto ssc = S.addClass<SocketServer>("SocketServer");
-    ssc.prop("port", &SocketServer::port_);
-    ssc.cfun("accept", &Listener_Accept);
-    ssc.cfun("stop", &Listener_Stop);
+    setbuf(stdout, 0);
+    lua_getglobal(L, "env");
+    _env = *static_cast<env **>(lua_touserdata(L, -1));
+    lua_pop(L, 1);
+
+    lua_networkclasses(L);
 
     lua_newtable(L);
     lua_pushcfunction(L, WebRequest);
-    lua_setfield(L, -2, "request");
+    lua_setfield(L, -2, "send");
     lua_pushcfunction(L, WebRequest_SimpleGET);
     lua_setfield(L, -2, "get");
     lua_pushcfunction(L, WebRequest_SimpleDownload);
     lua_setfield(L, -2, "download");
+    lua_pushcfunction(L, Connection_Create);
+    lua_setfield(L, -2, "connect");
     lua_pushcfunction(L, Listener_Create);
-    lua_setfield(L, -2, "listener");
+    lua_setfield(L, -2, "listen");
+    lua_pushcfunction(L, +[](lua_State* L) -> int {
+        lua_pushinteger(L, WSAGetLastError());
+        return 1;
+    });
+    lua_setfield(L, -2, "last_error");
+    lua_pushcfunction(L, (+[](lua_State* L) -> int {
+        auto host = luaL_checkstring(L, 1);
+        auto retries = luaL_optinteger(L, 2, 1);
+        auto [success, ping] = CPing::Ping(retries, host);
+        if (success) {
+            lua_pushinteger(L, ping);
+            return 1;
+        }
+        return 0;
+    }));
+    lua_setfield(L, -2, "ping");
     return 1;
 }

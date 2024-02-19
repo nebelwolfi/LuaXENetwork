@@ -2,6 +2,8 @@
 
 #include "BaseSock.h"
 #include "Utilities.h"
+#include <thread>
+#include <chrono>
 
 CBaseSock::CBaseSock(SOCKET s, HANDLE StopEvent)
 	: CBaseSock(StopEvent)
@@ -306,7 +308,6 @@ int CBaseSock::SendPartial(LPCVOID lpBuf, const size_t Len)
 	const int rc = WSASend(ActualSocket, &buffer, 1, &bytes_sent, 0, &os, nullptr);
 	LastError = WSAGetLastError();
 
-	
 	const auto p1 = std::chrono::system_clock::now();
 	const auto SecondsLeft = SendEndTime - std::chrono::duration_cast<std::chrono::seconds>(p1.time_since_epoch()).count();
 	if (SecondsLeft <= 0)
@@ -359,7 +360,12 @@ int CBaseSock::SendPartial(LPCVOID lpBuf, const size_t Len)
 				LastError = e;
 		}
 	}
-	return SOCKET_ERROR;
+
+    if (LastError == WSAECONNRESET) {
+        Disconnect();
+    }
+
+    return SOCKET_ERROR;
 }
 
 bool CBaseSock::Connect(LPCWSTR HostName, USHORT PortNumber)
@@ -445,4 +451,57 @@ bool CBaseSock::Connect(LPCWSTR HostName, USHORT PortNumber)
 	//}
 
 	return SUCCEEDED(Setup());
+}
+
+sockaddr_storage CBaseSock::GetLocal() {
+    sockaddr_storage sa;
+    int len = sizeof(sa);
+    getsockname(ActualSocket, (sockaddr*)&sa, &len);
+    return sa;
+}
+
+sockaddr_storage CBaseSock::GetRemote() {
+    sockaddr_storage sa;
+    int len = sizeof(sa);
+    getpeername(ActualSocket, (sockaddr*)&sa, &len);
+    return sa;
+}
+
+std::string CBaseSock::ReceiveBytes(unsigned long max_recv) {
+    std::string ret;
+
+    while (!max_recv) {
+        int ctl = ioctlsocket(ActualSocket, FIONREAD, &max_recv);
+        if (ctl == SOCKET_ERROR) {
+            return "";
+        }
+        //printf("ioctlsocket returned %d, max_recv = %d\n", ctl, max_recv);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    while (max_recv > 0) {
+        ret.resize(ret.size() + max_recv);
+        int len = recv(ActualSocket, ret.data() + ret.size() - max_recv, max_recv, 0);
+        if (len == 0) {
+            return ret;
+        }
+        if (len == -1) {
+            return "";
+        }
+        //printf("Requested %d, received %d\n", max_recv, len);
+        max_recv -= len;
+    }
+
+    return ret;
+}
+
+bool CBaseSock::Closed() {
+    if (ActualSocket == INVALID_SOCKET) return true;
+    int error_code;
+    int error_code_size = sizeof(error_code);
+    getsockopt(ActualSocket, SOL_SOCKET, SO_ERROR, (char*)&error_code, &error_code_size);
+    if (error_code != 0) {
+        return true;
+    }
+    return false;
 }

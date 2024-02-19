@@ -27,8 +27,14 @@ public:
 	virtual int RecvPartial(LPVOID lpBuf, const size_t Len);
 	virtual int SendPartial(LPCVOID lpBuf, const size_t Len);
 
-protected:
+    sockaddr_storage GetLocal();
+    sockaddr_storage GetRemote();
+
+    std::string ReceiveBytes(unsigned long);
+    bool Closed();
+
 	SOCKET ActualSocket{ INVALID_SOCKET };
+protected:
 	HANDLE m_hStopEvent{ nullptr };
 	virtual void StartRecvTimerInternal();
 	virtual void StartSendTimerInternal();

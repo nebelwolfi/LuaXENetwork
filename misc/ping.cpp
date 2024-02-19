@@ -5,9 +5,8 @@
 //
 
 #include <cassert>
-#include "../connection/Socket.h"
+#include "../socket/Socket.h"
 #include "ping.h"
-
 
 std::pair<bool, uint32_t> CPing::Ping(UINT nRetries,LPCSTR pstrHost)
 {

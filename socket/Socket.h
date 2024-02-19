@@ -25,14 +25,7 @@ public:
 
 	void   Close();
 
-	// The parameter of SendLine is not a const reference
-	// because SendLine modifes the std::string passed.
-	void   SendLine(std::string);
-
-	// The parameter of SendBytes is a const reference
-	// because SendBytes does not modify the std::string passed 
-	// (in contrast to SendLine).
-	void   SendBytes(const std::string&);
+	int   SendBytes(std::string&&);
 
     sockaddr_storage GetLocal();
     sockaddr_storage GetRemote();
@@ -45,6 +38,7 @@ protected:
 
 public:
 	Socket(SOCKET s);
+    bool Closed();
 
 protected:
     Socket();
@@ -71,6 +65,7 @@ public:
     std::unique_ptr<Socket> Accept();
 
     int port_;
+    TypeSocket type_;
 };
 
 class SocketSelect {

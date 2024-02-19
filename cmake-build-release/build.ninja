@@ -58,15 +58,6 @@ build CMakeFiles\LuaNetworkBinding.dir\main.cpp.obj: CXX_COMPILER__LuaNetworkBin
   TARGET_COMPILE_PDB = CMakeFiles\LuaNetworkBinding.dir\
   TARGET_PDB = LuaNetworkBinding.pdb
 
-build CMakeFiles\LuaNetworkBinding.dir\connection\Socket.cpp.obj: CXX_COMPILER__LuaNetworkBinding_unscanned_Release D$:\LuaNetworkBinding\connection\Socket.cpp || cmake_object_order_depends_target_LuaNetworkBinding
-  DEFINES = -DLuaNetworkBinding_EXPORTS
-  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++latest -MT /Zi /O2 /showIncludes
-  INCLUDES = -ID:\LuaNetworkBinding\. -ID:\LuaNetworkBinding\Dependencies\Include -IC:\LuaJIT-2.1.M.64\src -ID:\LuaBindingGit
-  OBJECT_DIR = CMakeFiles\LuaNetworkBinding.dir
-  OBJECT_FILE_DIR = CMakeFiles\LuaNetworkBinding.dir\connection
-  TARGET_COMPILE_PDB = CMakeFiles\LuaNetworkBinding.dir\
-  TARGET_PDB = LuaNetworkBinding.pdb
-
 build CMakeFiles\LuaNetworkBinding.dir\misc\Time.cpp.obj: CXX_COMPILER__LuaNetworkBinding_unscanned_Release D$:\LuaNetworkBinding\misc\Time.cpp || cmake_object_order_depends_target_LuaNetworkBinding
   DEFINES = -DLuaNetworkBinding_EXPORTS
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++latest -MT /Zi /O2 /showIncludes
@@ -157,6 +148,15 @@ build CMakeFiles\LuaNetworkBinding.dir\socket\SSLClient.cpp.obj: CXX_COMPILER__L
   TARGET_COMPILE_PDB = CMakeFiles\LuaNetworkBinding.dir\
   TARGET_PDB = LuaNetworkBinding.pdb
 
+build CMakeFiles\LuaNetworkBinding.dir\socket\Socket.cpp.obj: CXX_COMPILER__LuaNetworkBinding_unscanned_Release D$:\LuaNetworkBinding\socket\Socket.cpp || cmake_object_order_depends_target_LuaNetworkBinding
+  DEFINES = -DLuaNetworkBinding_EXPORTS
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++latest -MT /Zi /O2 /showIncludes
+  INCLUDES = -ID:\LuaNetworkBinding\. -ID:\LuaNetworkBinding\Dependencies\Include -IC:\LuaJIT-2.1.M.64\src -ID:\LuaBindingGit
+  OBJECT_DIR = CMakeFiles\LuaNetworkBinding.dir
+  OBJECT_FILE_DIR = CMakeFiles\LuaNetworkBinding.dir\socket
+  TARGET_COMPILE_PDB = CMakeFiles\LuaNetworkBinding.dir\
+  TARGET_PDB = LuaNetworkBinding.pdb
+
 build CMakeFiles\LuaNetworkBinding.dir\socket\Utilities.cpp.obj: CXX_COMPILER__LuaNetworkBinding_unscanned_Release D$:\LuaNetworkBinding\socket\Utilities.cpp || cmake_object_order_depends_target_LuaNetworkBinding
   DEFINES = -DLuaNetworkBinding_EXPORTS
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++latest -MT /Zi /O2 /showIncludes
@@ -174,7 +174,7 @@ build CMakeFiles\LuaNetworkBinding.dir\socket\Utilities.cpp.obj: CXX_COMPILER__L
 #############################################
 # Link the shared library LuaNetworkBinding.dll
 
-build LuaNetworkBinding.dll LuaNetworkBinding.lib: CXX_SHARED_LIBRARY_LINKER__LuaNetworkBinding_Release CMakeFiles\LuaNetworkBinding.dir\main.cpp.obj CMakeFiles\LuaNetworkBinding.dir\connection\Socket.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\Time.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\base64.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\md5.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\misc.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\ping.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\ActiveSock.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\BaseSock.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\CertHelper.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\CertRAII.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\SSLClient.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\Utilities.cpp.obj | C$:\LuaJIT-2.1.M.64\src\lua51.lib D$:\LuaNetworkBinding\dll.def
+build LuaNetworkBinding.dll LuaNetworkBinding.lib: CXX_SHARED_LIBRARY_LINKER__LuaNetworkBinding_Release CMakeFiles\LuaNetworkBinding.dir\main.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\Time.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\base64.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\md5.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\misc.cpp.obj CMakeFiles\LuaNetworkBinding.dir\misc\ping.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\ActiveSock.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\BaseSock.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\CertHelper.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\CertRAII.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\SSLClient.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\Socket.cpp.obj CMakeFiles\LuaNetworkBinding.dir\socket\Utilities.cpp.obj | C$:\LuaJIT-2.1.M.64\src\lua51.lib D$:\LuaNetworkBinding\dll.def
   LANGUAGE_COMPILE_FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MT
   LINK_FLAGS = /machine:x64 /INCREMENTAL:NO  /nologo /OPT:REF /OPT:ICF /INCREMENTAL /MACHINE:X64 /LARGEADDRESSAWARE /LTCG /DEBUG /DEF:D:\LuaNetworkBinding\dll.def
   LINK_LIBRARIES = C:\LuaJIT-2.1.M.64\src\lua51.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib

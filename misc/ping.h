@@ -10,15 +10,15 @@
 class CPing
 {
 public:
-    std::pair<bool, uint32_t> Ping(UINT nRetries,LPCSTR pstrHost);
-    int  WaitForEchoReply(SOCKET s);
+    static std::pair<bool, uint32_t> Ping(UINT nRetries,LPCSTR pstrHost);
+    static int  WaitForEchoReply(SOCKET s);
     // ICMP Echo Request/Reply functions
-    int		SendEchoRequest(SOCKET, LPSOCKADDR_IN);
-    DWORD	RecvEchoReply(SOCKET, LPSOCKADDR_IN, u_char *);
-    u_short in_cksum(u_short *addr, int len);
+    static int		SendEchoRequest(SOCKET, LPSOCKADDR_IN);
+    static DWORD	RecvEchoReply(SOCKET, LPSOCKADDR_IN, u_char *);
+    static u_short in_cksum(u_short *addr, int len);
 
 protected:
-    void WSAError(LPCSTR pstrFrom);
+    static void WSAError(LPCSTR pstrFrom);
 
 };
 

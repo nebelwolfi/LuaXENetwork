@@ -75,17 +75,31 @@ void Socket::Close() {
     closed = true;
 }
 
+bool Socket::Closed() {
+    if (closed) return true;
+    int error_code;
+    int error_code_size = sizeof(error_code);
+    getsockopt(s_, SOL_SOCKET, SO_ERROR, (char*)&error_code, &error_code_size);
+    if (error_code != 0) {
+        return true;
+    }
+    return false;
+}
+
 std::string Socket::ReceiveBytes(unsigned long max_recv) {
 	std::string ret;
+    unsigned long can_recv = 0;
 
-    while (!max_recv) {
-        int ctl = ioctlsocket(s_, FIONREAD, &max_recv);
+    while (!can_recv || can_recv < max_recv) {
+        int ctl = ioctlsocket(s_, FIONREAD, &can_recv);
         if (ctl == SOCKET_ERROR) {
             return "";
         }
         //printf("ioctlsocket returned %d, max_recv = %d\n", ctl, max_recv);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    if (can_recv && !max_recv)
+        max_recv = can_recv;
 
     while (max_recv > 0) {
         ret.resize(ret.size() + max_recv);
@@ -129,13 +143,18 @@ std::string Socket::ReceiveLine() {
 	}
 }
 
-void Socket::SendLine(std::string s) {
-	s += '\n';
-	send(s_, s.c_str(), s.length(), 0);
-}
-
-void Socket::SendBytes(const std::string& s) {
-	send(s_, s.c_str(), s.length(), 0);
+int Socket::SendBytes(std::string&& s) {
+	int r = send(s_, s.c_str(), s.length(), 0);
+    if (r == SOCKET_ERROR) {
+        auto err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            return 0;
+        } else if (err == WSAECONNRESET) {
+            closed = true;
+            return -1;
+        }
+    }
+    return r;
 }
 
 sockaddr_storage Socket::GetLocal() {
@@ -164,6 +183,7 @@ SocketServer::SocketServer(int port, TypeSocket type) {
 		throw "INVALID_SOCKET";
 	}
 
+    type_ = type;
 	if (type == NonBlockingSocket) {
 		u_long arg = 1;
 		ioctlsocket(s_, FIONBIO, &arg);
