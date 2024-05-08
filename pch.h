@@ -42,18 +42,7 @@
 #include <WS2tcpip.h>
 
 #include <lua.hpp>
-namespace LuaBinding {
-    using string_type = std::string;
-}
-#include <LuaBinding.h>
+#include <shared/env.h>
+#include <shared/bind.h>
 
-struct env {
-    void exit() {
-        ::exit(0);
-    }
-    bool should_exit = false;
-    bool should_restart = false;
-    bool should_relaunch = false;
-    std::unique_ptr<LuaBinding::State>(*new_state)() = 0;
-};
 #endif //LUANETWORKBINDING_PCH_H

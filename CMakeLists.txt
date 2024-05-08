@@ -4,9 +4,8 @@ project(LuaNetworkBinding)
 set(CMAKE_CXX_STANDARD 23)
 
 include_directories(.)
-include_directories(Dependencies\\Include\\)
 include_directories(C:\\LuaJIT-2.1.M.64\\src)
-include_directories(D:\\LuaBindingGit\\)
+include_directories(D:\\LuaXE\\include)
 
 file(GLOB_RECURSE misc misc/*.cpp misc/*.h)
 file(GLOB_RECURSE socket socket/*.cpp socket/*.h)
@@ -14,11 +13,11 @@ file(GLOB_RECURSE websocketpp websocketpp/*.cpp websocketpp/*.h)
 
 add_library(LuaNetworkBinding SHARED main.cpp dll.def ${misc} ${socket} ${websocketpp} pch.h)
 
-find_library(LUAJ5164_3 lua51 lib C:\\LuaJIT-2.1.M.64\\src\\)
+find_library(LUAJ lua51dyn lib C:\\LuaJIT-2.1.M.64\\src\\)
 
-target_link_libraries(LuaNetworkBinding LINK_PUBLIC ${LUAJ5164_3})
+target_link_libraries(LuaNetworkBinding LINK_PUBLIC ${LUAJ})
 
-MESSAGE(STATUS "LUAJIT: " ${LUAJ5164_3})
+MESSAGE(STATUS "LUAJIT: " ${LUAJ})
 
 set_property(TARGET LuaNetworkBinding PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_compile_options(

@@ -1,5 +1,0 @@
-"C:\Program Files\JetBrains\CLion 2022.2.3\bin\cmake\win\x64\bin\cmake.exe" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_MAKE_PROGRAM=C:/Program Files/JetBrains/CLion 2022.2.3/bin/ninja/win/x64/ninja.exe" "-DCMAKE_C_COMPILER=C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe" -G Ninja -S D:\LuaNetworkBinding -B D:\LuaNetworkBinding\cmake-build-release
--- LUAJIT: C:/LuaJIT-2.1.M.64/src/lua51.lib
--- Configuring done (0.0s)
--- Generating done (0.0s)
--- Build files have been written to: D:/LuaNetworkBinding/cmake-build-release
