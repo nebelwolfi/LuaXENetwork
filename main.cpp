@@ -49,6 +49,7 @@ std::string RequestBuilder(lua_State *L, std::string host, int idx = -1) {
         request += "HTTP/1.1\r\n";
     }
     lua_pop(L, 1);
+    request += "Host: " + host + "\r\n";
     if (auto header_type = luaL_getfield(L, idx, "headers"); header_type == LUA_TTABLE) {
         lua_pushnil(L);
         while (lua_next(L, -2) != 0) {
@@ -65,7 +66,6 @@ std::string RequestBuilder(lua_State *L, std::string host, int idx = -1) {
         request += "Accept: */*\r\n";
     }
     lua_pop(L, 1);
-    request += "Host: " + host + "\r\n";
     if (luaL_getfield(L, idx, "body") == LUA_TSTRING) {
         request += "Content-Length: ";
         request += std::to_string(lua_objlen(L, -1));
@@ -87,7 +87,8 @@ std::string ResponseBuilder(lua_State *L, int idx = 1) {
     } else {
         request += "HTTP/1.1 ";
     }
-    if (luaL_getfield(L, idx, "status") == LUA_TNUMBER) {
+    lua_getfield(L, idx, "status");
+    if (lua_isnumber(L, -1)) {
         request += std::to_string(lua_tointeger(L, -1));
         request += " ";
     } else {
@@ -124,7 +125,6 @@ bool WorkOnBody(std::string& Body, std::string& ChunkedBody, int& CurrentChunkSi
     if (CurrentChunkSize == 0) { // no chunksize yet, check for one
         auto EndOfLine = Body.find_first_of("\r\n");
         if (EndOfLine == std::string::npos) { // failed to get a chunksize, that should not really be possible
-            //std::cout << "Failed to get Chunksize" << std::endl;
             return false;
         }
         //Log(Log::green, "%s", Body.c_str());
@@ -154,7 +154,7 @@ bool WorkOnBody(std::string& Body, std::string& ChunkedBody, int& CurrentChunkSi
     return false;
 }
 
-std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std::wstring& HostW, int Port, const std::string& RequestString) {
+std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std::wstring& HostW, int Port, const std::string& RequestString, bool force_ssl) {
     CEventWrapper ShutDownEvent;
     auto pActiveSock = std::make_unique<CActiveSock>(ShutDownEvent);
     pActiveSock->SetRecvTimeoutSeconds(30);
@@ -166,7 +166,7 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         return "";
     }
     std::unique_ptr<CSSLClient> pSSLClient;
-    if (Port == 443)
+    if (Port == 443 || force_ssl)
     {
         pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
         pSSLClient->ServerCertAcceptable = CertAcceptable;
@@ -174,8 +174,9 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         HRESULT hr = pSSLClient->Initialize(HostW.c_str());
         if (SUCCEEDED(hr)) {
             pSSLClient->Send(RequestString.c_str(), RequestString.size());
-        } else
+        } else {
             pActiveSock->Send(RequestString.c_str(), RequestString.size());
+        }
     } else {
         pActiveSock->Send(RequestString.c_str(), RequestString.size());
     }
@@ -192,6 +193,7 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
     std::string Body = "";
     std::string ChunkedBody = "";
 
+    try {
     while (!RequestFinished) {
         std::string ReceiveMsgBuffer;
         ReceiveMsgBuffer.resize(BufferBytesReceiving);
@@ -199,10 +201,12 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         int BytesReceived = 0;
         int res = 0;
 
-        if (pSSLClient)
+        if (pSSLClient) {
             res = (BytesReceived = pSSLClient->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
-        else
+        }
+        else {
             res = (BytesReceived = pActiveSock->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
+        }
         if (0 < res) {
             std::string ReceiveMsg = ReceiveMsgBuffer.substr(0, BytesReceived);
             CompleteReceive += ReceiveMsg;
@@ -232,6 +236,19 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
                     }
                 } else {
                     int ContentLengthStart = Header.find("Content-Length:");
+                    if (ContentLengthStart == std::string::npos) {
+                        ContentLengthStart = Header.find("Content-length:");
+                        if (ContentLengthStart == std::string::npos) {
+                            ContentLengthStart = Header.find("content-length:");
+                            if (ContentLengthStart == std::string::npos) {
+                                ContentLengthStart = Header.find("content-Length:");
+                                if (ContentLengthStart == std::string::npos) {
+                                    luaL_error(L, "No Content-Length found in Header");
+                                    return "";
+                                }
+                            }
+                        }
+                    }
                     int ContentLengthEnd = Header.find("\r\n", ContentLengthStart + 16);
                     ContentLength = std::stoi(Header.substr(ContentLengthStart + 16, ContentLengthEnd - ContentLengthStart - 16));
                     if (Body.size() >= ContentLength) {
@@ -253,13 +270,16 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
             RequestFinished = true;
         }
     }
+    } catch (std::exception& e) {
+        luaL_error(L, "Error receiving data: %s", e.what());
+    }
     if (Body.size() < ContentLength) {
         luaL_error(L, "Content-Length mismatch! %d vs %d", Body.size(), ContentLength);
         return "";
     }
     if (Body.empty()) {
         //luaL_error(L, "No Body received");
-        return CompleteReceive;
+        return "";
     }
     //printf("%s\n", Header.c_str());
     //printf("Body length: %d\n", Body.size());
@@ -267,17 +287,18 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
 }
 
 static int WebRequest(lua_State *L) {
-    if (lua_isnoneornil(L, 2)) lua_newtable(L);
     std::string HostA;
     std::wstring HostW;
     int Port = 443;
+    bool force_ssl = false;
     if (lua_isstring(L, 1) && lua_gettop(L) > 1) {
         HostA = lua_tostring(L, 1);
         HostW = std::wstring(HostA.begin(), HostA.end());
         if (lua_isnumber(L, 2)) {
             Port = lua_tointeger(L, 2);
         } else if (lua_istable(L, 2)) {
-            if (luaL_getfield(L, 2, "port") == LUA_TNUMBER) {
+            lua_getfield(L, 2, "port");
+            if (lua_isnumber(L, -1)) {
                 Port = lua_tointeger(L, -1);
             }
             lua_pop(L, 1);
@@ -287,12 +308,18 @@ static int WebRequest(lua_State *L) {
             HostA = lua_tostring(L, -1);
             HostW = utf8_decode_lua(HostA);
         } else {
+            lua_pop(L, 1);
             luaL_error(L, "request.host is not a string");
             return 0;
         }
         lua_pop(L, 1);
-        if (luaL_getfield(L, 1, "port") == LUA_TNUMBER) {
+        lua_getfield(L, 1, "port");
+        if (lua_isnumber(L, -1)) {
             Port = lua_tointeger(L, -1);
+        }
+        lua_pop(L, 1);
+        if (luaL_getfield(L, 1, "ssl") == LUA_TBOOLEAN) {
+            force_ssl = lua_toboolean(L, -1);
         }
         lua_pop(L, 1);
     } else {
@@ -300,8 +327,8 @@ static int WebRequest(lua_State *L) {
         return 0;
     }
 
-    std::string RequestString = RequestBuilder(L, HostA);
-    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString);
+    std::string RequestString = RequestBuilder(L, HostA + ":" + std::to_string(Port));
+    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString, force_ssl);
     lua_pushlstring(L, Response.c_str(), Response.size());
     return 1;
 }
@@ -332,7 +359,7 @@ static int WebRequest_SimpleGET(lua_State *L) {
     }
     std::wstring HostW = utf8_decode_lua(HostA);
     std::string RequestString = "GET " + path + " HTTP/1.1\r\nAccept: text/html\r\nAccept-Encoding: none\r\nAccept-Language: en-US;q=0.8,en;q=0.7\r\nCache-Control: no-cache\r\nHost: " + HostA + "\r\n\r\n";
-    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString);
+    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString, false);
     lua_pushlstring(L, Response.c_str(), Response.size());
     return 1;
 }
@@ -358,7 +385,7 @@ static int WebRequest_SimpleDownload(lua_State *L) {
     std::wstring HostW = utf8_decode_lua(HostA);
     std::filesystem::path LocalPath = luaL_checkstring(L, 2);
     std::string RequestString = "GET " + url.substr(url.find('/')) + " HTTP/1.1\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9\r\nAccept-Encoding: gzip, deflate, br\r\nAccept-Language: en-US;q=0.8,en;q=0.7\r\nCache-Control: no-cache\r\nHost: " + HostA + "\r\n\r\n";
-    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString);
+    std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString, false);
     std::error_code ec;
     if (!std::filesystem::exists(LocalPath.parent_path(), ec))
         std::filesystem::create_directories(LocalPath.parent_path(), ec);
@@ -538,7 +565,8 @@ public:
                 Port = lua_tointeger(L, 2);
                 block = lua_toboolean(L, 3);
             } else if (lua_istable(L, 2)) {
-                if (luaL_getfield(L, 2, "port") == LUA_TNUMBER) {
+                lua_getfield(L, 2, "port");
+                if (lua_isnumber(L, -1)) {
                     Port = lua_tointeger(L, -1);
                 }
                 lua_pop(L, 1);
@@ -558,7 +586,8 @@ public:
                 return;
             }
             lua_pop(L, 1);
-            if (luaL_getfield(L, 1, "port") == LUA_TNUMBER) {
+            lua_getfield(L, 1, "port");
+            if (lua_isnumber(L, -1)) {
                 Port = lua_tointeger(L, -1);
             }
             lua_pop(L, 1);
@@ -945,8 +974,9 @@ int lua_networkclasses(lua_State* L) {
 }
 
 int luaopen_network(lua_State* L) {
-    setbuf(stdout, 0);
     lua::env::init(L);
+
+    setvbuf(stdout, NULL, _IONBF, 0);
 
     lua_networkclasses(L);
 

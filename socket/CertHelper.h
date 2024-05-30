@@ -19,12 +19,14 @@ PCCERT_CONTEXT CreateCertificate(bool MachineCert = false, LPCWSTR Subject = nul
 static bool CertAcceptable(PCCERT_CONTEXT pCertContext, const bool trusted, const bool matchingName)
 {
 	//std::wcout << GetCertName(pCertContext) << "\t" << trusted << "\t" << matchingName << std::endl;
-	if (!trusted) {
-		return false;
-	}
-	if (!matchingName) {
-		return false;
-	}
+	//if (!trusted) {
+    //    std::wcout << L"Certificate is not trusted" << std::endl;
+	//	return false;
+	//}
+	//if (!matchingName) {
+    //    std::wcout << L"Certificate name does not match" << std::endl;
+	//	return false;
+	//}
 	//if (GetCertName(pCertContext).find(L".zenbot.gg") == std::wstring::npos
 	// && GetCertName(pCertContext).find(L"sni.cloudflaressl.com") == std::wstring::npos) {
 	//	return false;

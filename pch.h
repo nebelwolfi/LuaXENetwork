@@ -41,8 +41,6 @@
 #include <wincodec.h>
 #include <WS2tcpip.h>
 
-#include <lua.hpp>
-#include <shared/env.h>
-#include <shared/bind.h>
+#include <luaxe/luaxe.hpp>
 
 #endif //LUANETWORKBINDING_PCH_H

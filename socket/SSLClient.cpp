@@ -52,11 +52,12 @@ HRESULT CSSLClient::Initialize(LPCWSTR ServerName, const void * const lpBuf, con
 	CertContextHandle hCertContext;
 	if (SelectClientCertificate)
 	{
-		hr = SelectClientCertificate(*hCertContext.set(), NULL, false);
+        hr = SelectClientCertificate(*hCertContext.set(), NULL, false);
 		if FAILED(hr)
 			DebugMsg("Optional client certificate not selected");
 	}
-	// If a certificate is required, it will be requested later 
+
+    // If a certificate is required, it will be requested later
 	hr = CreateCredentialsFromCertificate(m_ClientCreds.set(), hCertContext.get());
 	if FAILED(hr) return hr;
 
@@ -67,11 +68,12 @@ HRESULT CSSLClient::Initialize(LPCWSTR ServerName, const void * const lpBuf, con
 	}
 	else
 		readBufferBytes = 0;
-	// Perform SSL handshake
+
+    // Perform SSL handshake
 	hr = SSPINegotiateLoop(ServerName);
 	if (FAILED(hr))
 	{
-		DebugMsg("Couldn't connect");
+        DebugMsg("Couldn't connect");
 		return hr;
 	}
 
