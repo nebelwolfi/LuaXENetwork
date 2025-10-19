@@ -5,13 +5,15 @@ set(CMAKE_CXX_STANDARD 23)
 
 include_directories(.)
 include_directories(C:\\LuaJIT-2.1.M.64\\src)
-include_directories(D:\\LuaXE\\shared\\include)
+include_directories(..\\..\\shared\\include\\)
 
 file(GLOB_RECURSE misc misc/*.cpp misc/*.h)
 file(GLOB_RECURSE socket socket/*.cpp socket/*.h)
 file(GLOB_RECURSE websocketpp websocketpp/*.cpp websocketpp/*.h)
 
-add_library(LuaNetworkBinding SHARED main.cpp dll.def ${misc} ${socket} ${websocketpp} pch.h)
+add_library(LuaNetworkBinding SHARED main.cpp dll.def ${misc} ${socket} ${websocketpp} pch.h
+        connection.cpp
+        connection.h)
 
 find_library(LUAJ lua51dyn lib C:\\LuaJIT-2.1.M.64\\src\\)
 
@@ -33,4 +35,4 @@ target_link_options(LuaNetworkBinding PRIVATE "/OPT:REF")
 target_link_options(LuaNetworkBinding PRIVATE "/OPT:ICF")
 
 add_custom_command(TARGET LuaNetworkBinding POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy LuaNetworkBinding.dll "network.dll")
-#add_custom_command(TARGET LuaNetworkBinding POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy LuaNetworkBinding.dll "D:\\Discovery\\network.dll")
+add_custom_command(TARGET LuaNetworkBinding POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy LuaNetworkBinding.dll "C:\\Users\\Denni\\Desktop\\asklepios\\modules\\network\\network.dll")

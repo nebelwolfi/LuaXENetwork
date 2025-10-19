@@ -24,6 +24,8 @@
 #include <future>
 #include <filesystem>
 
+#include "connection.h"
+
 std::string RequestBuilder(lua_State *L, std::string host, int idx = -1) {
     idx = lua_absindex(L, idx);
     if (lua_isstring(L, idx)) return lua_tostring(L, idx);
@@ -122,29 +124,30 @@ std::string ResponseBuilder(lua_State *L, int idx = 1) {
 }
 
 bool WorkOnBody(std::string& Body, std::string& ChunkedBody, int& CurrentChunkSize) {
+    //printf("workonbody\n");
     if (CurrentChunkSize == 0) { // no chunksize yet, check for one
         auto EndOfLine = Body.find_first_of("\r\n");
         if (EndOfLine == std::string::npos) { // failed to get a chunksize, that should not really be possible
+            //printf("failed to get a chunksize\n");
             return false;
         }
-        //Log(Log::green, "%s", Body.c_str());
+        //printf("Body: %s", Body.c_str());
 
         auto ChunkSize = Body.substr(0, EndOfLine);
         Body = Body.substr(EndOfLine + 2);
         CurrentChunkSize = std::stol(ChunkSize, nullptr, 16);
         if (CurrentChunkSize == 0) { // return since i got the last chunk
-            //Log(Log::red, "got last chunk");
+            //printf("got last chunk");
             CurrentChunkSize = -1;
             return false;
-        }
-        else {
+        } else {
             return true;
         }
     }
 
     if (Body.size() >= CurrentChunkSize + 2) { // body size is big enouth for chunkedbody
         ChunkedBody += Body.substr(0, CurrentChunkSize);
-        //Log(Log::blue, "%s", ChunkedBody.c_str());
+        //printf("ChunkedBody: %s", ChunkedBody.c_str());
 
         Body = Body.substr(CurrentChunkSize + 2);
         CurrentChunkSize = 0;
@@ -203,22 +206,24 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
 
         if (pSSLClient) {
             res = (BytesReceived = pSSLClient->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
-        }
-        else {
+        } else {
             res = (BytesReceived = pActiveSock->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
         }
         if (0 < res) {
             std::string ReceiveMsg = ReceiveMsgBuffer.substr(0, BytesReceived);
             CompleteReceive += ReceiveMsg;
+            //printf("ReceivedMsg");
             if (!GotHeaders && CompleteReceive.find("\r\n\r\n") != std::string::npos) {
                 Header = CompleteReceive.substr(0, CompleteReceive.find("\r\n\r\n"));
                 Body = CompleteReceive.substr(CompleteReceive.find("\r\n\r\n") + 4);
                 GotHeaders = true;
 
-                if (Header.find("Transfer-Encoding: chunked") != std::string::npos) {
+                if (Header.find("ncoding: chunked") != std::string::npos) {
                     IsChunked = true;
                 }
                 AlreadyAddedNewMsg = true;
+
+                //printf("Header: %s", Header.c_str());
             }
             if (GotHeaders) {
                 if (!AlreadyAddedNewMsg) {
@@ -242,17 +247,19 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
                             ContentLengthStart = Header.find("content-length:");
                             if (ContentLengthStart == std::string::npos) {
                                 ContentLengthStart = Header.find("content-Length:");
-                                if (ContentLengthStart == std::string::npos) {
-                                    luaL_error(L, "No Content-Length found in Header");
-                                    return "";
-                                }
                             }
                         }
                     }
-                    int ContentLengthEnd = Header.find("\r\n", ContentLengthStart + 16);
-                    ContentLength = std::stoi(Header.substr(ContentLengthStart + 16, ContentLengthEnd - ContentLengthStart - 16));
-                    if (Body.size() >= ContentLength) {
-                        RequestFinished = true;
+                    if (ContentLengthStart == std::string::npos) {
+                        if (Body.ends_with("0\r\n\r\n")) {
+                            RequestFinished = true;
+                        }
+                    } else {
+                        int ContentLengthEnd = Header.find("\r\n", ContentLengthStart + 16);
+                        ContentLength = std::stoi(Header.substr(ContentLengthStart + 16, ContentLengthEnd - ContentLengthStart - 16));
+                        if (Body.size() >= ContentLength) {
+                            RequestFinished = true;
+                        }
                     }
                 }
             }
@@ -262,6 +269,7 @@ std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std:
         else if (res == 0)
         {
             //luaL_error(L, "Connection closed by server");
+            //printf("Connection closed by server\n");
             RequestFinished = true;
         }
         else
@@ -328,6 +336,7 @@ static int WebRequest(lua_State *L) {
     }
 
     std::string RequestString = RequestBuilder(L, HostA + ":" + std::to_string(Port));
+    //printf("%s\n", RequestString.c_str());
     std::string Response = ResolveWebRequest(L, HostA, HostW, Port, RequestString, force_ssl);
     lua_pushlstring(L, Response.c_str(), Response.size());
     return 1;
@@ -641,22 +650,11 @@ public:
         s->pActiveSock->Disconnect();
         return 0;
     }
-    //auto GetRemote() { return pActiveSock->GetRemote(); }
     static int GetRemote(lua_State *L) {
         auto s = lua::check<ConnectionContext>(L, 1);
         new (lua::alloc<decltype(s->pActiveSock->GetRemote())>(L)) decltype(s->pActiveSock->GetRemote())(s->pActiveSock->GetRemote());
         return 1;
     }
-    //auto GetPort() {
-    //    sockaddr_storage s = pActiveSock->GetLocal();
-    //    if (s.ss_family == AF_INET) {
-    //        auto sa = (sockaddr_in*)&s;
-    //        return ntohs(sa->sin_port);
-    //    } else {
-    //        auto sa = (sockaddr_in6*)&s;
-    //        return ntohs(sa->sin6_port);
-    //    }
-    //}
     static int GetPort(lua_State *L) {
         auto s = lua::check<ConnectionContext>(L, 1);
         sockaddr_storage sa = s->pActiveSock->GetLocal();
@@ -669,23 +667,6 @@ public:
         }
         return 1;
     }
-    /*auto ReceiveBytes(unsigned long len) {
-        std::string buffer;
-        if (!len) {
-            buffer.resize(1024);
-            if (pSSLClient)
-                pSSLClient->Recv(&buffer[0], 1024);
-            else
-                pActiveSock->Recv(&buffer[0], 1024);
-        } else {
-            buffer.resize(len);
-            if (pSSLClient)
-                pSSLClient->Recv(&buffer[0], len, len);
-            else
-                pActiveSock->Recv(&buffer[0], len, len);
-        }
-        return buffer;
-    }*/
     static int ReceiveBytes(lua_State *L) {
         auto s = lua::check<ConnectionContext>(L, 1);
         auto len = luaL_optinteger(L, 2, 0);
@@ -973,12 +954,54 @@ int lua_networkclasses(lua_State* L) {
     return 0;
 }
 
+int lua_asyncclass(lua_State* L) {
+    auto ac = lua::bind::add<IAsyncConnection*>(L, "CAsyncSocket");
+    ac.meta_fun("__gc", [](lua_State *L) -> int {
+        auto s = lua::check<IAsyncConnection*>(L, 1);
+        if (*s) {
+            delete *s;
+            *s = nullptr;
+        }
+        return 0;
+    });
+    ac.fun("start", [](lua_State *L) {
+        auto c = lua::check<IAsyncConnection*>(L, 1);
+        if (!*c) return 0;
+        auto s = *c;
+        s->Start(luaL_checklstring(L, 2, nullptr));
+        return 0;
+    });
+    ac.fun("poll", [](lua_State *L) {
+        auto c = lua::check<IAsyncConnection*>(L, 1);
+        if (!*c) return 0;
+        auto s = *c;
+        lua_pushboolean(L, s->Poll());
+        return 1;
+    });
+    ac.fun("response", [](lua_State *L) {
+        auto c = lua::check<IAsyncConnection*>(L, 1);
+        if (!*c) return 0;
+        auto s = *c;
+        lua_pushlstring(L, s->Response().c_str(), s->Response().size());
+        return 1;
+    });
+    return 0;
+}
+
+int Async_Create(lua_State *L) {
+    auto host = luaL_checkstring(L, 1);
+    auto port = luaL_checkinteger(L, 2);
+    *lua::alloc<IAsyncConnection*>(L) = IAsyncConnection::Create(host, port);
+    return 1;
+}
+
 int luaopen_network(lua_State* L) {
     lua::env::init(L);
 
     setvbuf(stdout, NULL, _IONBF, 0);
 
     lua_networkclasses(L);
+    lua_asyncclass(L);
 
     lua_newtable(L);
     lua_pushcfunction(L, WebRequest);
@@ -991,6 +1014,8 @@ int luaopen_network(lua_State* L) {
     lua_setfield(L, -2, "connect");
     lua_pushcfunction(L, Listener_Create);
     lua_setfield(L, -2, "listen");
+    lua_pushcfunction(L, Async_Create);
+    lua_setfield(L, -2, "async");
     lua_pushcfunction(L, +[](lua_State* L) -> int {
         lua_pushinteger(L, WSAGetLastError());
         return 1;
