@@ -215,7 +215,14 @@ int CSSLClient::RecvPartialEncrypted(LPVOID lpBuf, const size_t Len)
 		}
 		const int err = m_SocketStream->Recv((CHAR*)readPtr + readBufferBytes, freeBytesAtEnd);
 		m_LastError = 0; // Means use the one from m_SocketStream
-		if ((err == SOCKET_ERROR) || (err == 0))
+		if (err == 0)
+		{
+			DebugMsg("Server closed the TLS connection");
+			m_encrypting = false;
+			m_LastError = 0;
+			return 0;
+		}
+		if (err == SOCKET_ERROR)
 		{
 			if (ERROR_TIMEOUT == m_SocketStream->GetLastError())
 				DebugMsg("Recv timed out");
@@ -250,8 +257,8 @@ int CSSLClient::RecvPartialEncrypted(LPVOID lpBuf, const size_t Len)
 	{
 		DebugMsg("Server signalled end of session");
 		m_encrypting = false;
-		m_LastError = scRet;
-		return SOCKET_ERROR;
+		m_LastError = 0;
+		return 0;
 	}
 	else
 	{
@@ -342,7 +349,7 @@ int CSSLClient::RecvPartialEncrypted(LPVOID lpBuf, const size_t Len)
 // whatever plaintext data the caller provides
 int CSSLClient::Send(LPCVOID lpBuf, const size_t Len)
 {
-	if (!lpBuf || Len > MaxMsgSize)
+	if (!lpBuf)
 		return SOCKET_ERROR;
 
 	if (!m_encrypting)
@@ -350,6 +357,27 @@ int CSSLClient::Send(LPCVOID lpBuf, const size_t Len)
 		DebugMsg("Send can only be called when encrypting");
 		m_LastError = ERROR_FILE_NOT_ENCRYPTED;
 		return SOCKET_ERROR;
+	}
+
+	// Schannel encrypts one TLS record at a time. Older callers were limited to
+	// a single ~16 KiB record, which made ordinary JSON/API requests fail as
+	// soon as their prompt grew. Split large plaintext writes into records while
+	// retaining the existing all-or-error Send contract.
+	const size_t schannelMaximum = Sizes.cbMaximumMessage ? Sizes.cbMaximumMessage : MaxMsgSize;
+	const size_t maxChunk = MaxMsgSize < schannelMaximum ? MaxMsgSize : schannelMaximum;
+	if (Len > maxChunk)
+	{
+		size_t total = 0;
+		while (total < Len)
+		{
+			const size_t remaining = Len - total;
+			const size_t chunk = maxChunk < remaining ? maxChunk : remaining;
+			const int sent = Send(static_cast<const char*>(lpBuf) + total, chunk);
+			if (sent == SOCKET_ERROR || sent <= 0)
+				return SOCKET_ERROR;
+			total += static_cast<size_t>(sent);
+		}
+		return static_cast<int>(total);
 	}
 
 	int err;

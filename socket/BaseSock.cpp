@@ -21,7 +21,7 @@ CBaseSock::CBaseSock(HANDLE StopEvent)
 	// Initialize the WinSock subsystem.
 	//
 	WSADATA wsadata;
-	if (WSAStartup(MAKEWORD(1, 1), &wsadata) == SOCKET_ERROR)
+	if (WSAStartup(MAKEWORD(2, 2), &wsadata) == SOCKET_ERROR)
 	{
 		DebugMsg("Error %d returned by WSAStartup", GetLastError());
 		throw "WSAStartup error";
@@ -42,22 +42,32 @@ DWORD CBaseSock::GetLastError() const
 HRESULT CBaseSock::Setup()
 {
     int rc = 1;
-    setsockopt(ActualSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&rc, sizeof(int));
+    if (setsockopt(ActualSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&rc, sizeof(int)) == SOCKET_ERROR)
+    {
+        LastError = WSAGetLastError();
+        return HRESULT_FROM_WIN32(LastError);
+    }
     if (!read_event)
         read_event = WSACreateEvent();
-    if (read_event != WSA_INVALID_EVENT)
+    if (read_event == WSA_INVALID_EVENT)
     {
-        if (!write_event)
-            write_event = WSACreateEvent();
-        if (write_event != WSA_INVALID_EVENT)
-        {
-            if (WSAResetEvent(read_event) && WSAResetEvent(write_event))
-                ;// printf("CBaseSock::Initialize - Events initialized\n");
-        }
+        LastError = WSAGetLastError();
+        return HRESULT_FROM_WIN32(LastError);
     }
-
-    LastError = WSAGetLastError();
-    return HRESULT_FROM_WIN32(LastError);
+    if (!write_event)
+        write_event = WSACreateEvent();
+    if (write_event == WSA_INVALID_EVENT)
+    {
+        LastError = WSAGetLastError();
+        return HRESULT_FROM_WIN32(LastError);
+    }
+    if (!WSAResetEvent(read_event) || !WSAResetEvent(write_event))
+    {
+        LastError = WSAGetLastError();
+        return HRESULT_FROM_WIN32(LastError);
+    }
+    LastError = ERROR_SUCCESS;
+    return S_OK;
 }
 
 HRESULT CBaseSock::Disconnect(bool CloseUnderlyingConnection)
