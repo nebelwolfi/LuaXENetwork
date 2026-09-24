@@ -816,8 +816,19 @@ static int WebRequest_SimpleDownload(lua_State *L) {
 }
 
 int Listener_Create(lua_State *L) {
-    int port = lua_tointeger(L, 1);
-    new (lua::alloc<SocketServer>(L)) SocketServer(port, lua_toboolean(L, 2) ? NonBlockingSocket : BlockingSocket);
+    int port = luaL_checkinteger(L, 1);
+    const char* bindAddress = luaL_optstring(L, 3, "127.0.0.1");
+    in_addr parsed{};
+    if (inet_pton(AF_INET, bindAddress, &parsed) != 1)
+        return luaL_error(L, "invalid IPv4 bind address: %s", bindAddress);
+    try {
+        new (lua::alloc<SocketServer>(L)) SocketServer(port,
+            lua_toboolean(L, 2) ? NonBlockingSocket : BlockingSocket, bindAddress);
+    } catch (const std::exception& error) {
+        return luaL_error(L, "%s", error.what());
+    } catch (const char* error) {
+        return luaL_error(L, "%s", error);
+    }
     return 1;
 }
 
@@ -923,40 +934,105 @@ public:
 
     static int lua_Request(lua_State *L) {
         auto ctx = lua::check<ListenerContext>(L, 1);
+        // ReceiveBytes is a Lua binding and expects a valid lua_State*. Calling
+        // it as a C++ helper used to pass nullptr here and crash in
+        // lua_isuserdata. Read from the owned socket directly instead.
         if (ctx->recv_buffer.empty())
-            ctx->recv_buffer = ctx->ReceiveBytes(0);
+            ctx->recv_buffer = ctx->sock->ReceiveBytes(0, 1000);
         if (ctx->recv_buffer.empty())
             return 0;
+
+        // A TCP receive is not guaranteed to contain the complete HTTP header.
+        // Keep reading until its boundary is available before parsing fields.
+        constexpr size_t max_header_bytes = 1024 * 1024;
+        size_t header_end = ctx->recv_buffer.find("\r\n\r\n");
+        while (header_end == std::string::npos && ctx->recv_buffer.size() < max_header_bytes) {
+            auto chunk = ctx->sock->ReceiveBytes(0, 1000);
+            if (chunk.empty()) break;
+            ctx->recv_buffer += chunk;
+            header_end = ctx->recv_buffer.find("\r\n\r\n");
+        }
+        if (header_end == std::string::npos)
+            return luaL_error(L, "Incomplete or oversized HTTP request header");
+
+        const size_t request_line_end = ctx->recv_buffer.find("\r\n");
+        const size_t first_space = ctx->recv_buffer.find(' ');
+        const size_t second_space = first_space == std::string::npos
+            ? std::string::npos : ctx->recv_buffer.find(' ', first_space + 1);
+        if (request_line_end == std::string::npos || first_space == std::string::npos
+            || second_space == std::string::npos || second_space > request_line_end)
+            return luaL_error(L, "Malformed HTTP request line");
+
+        std::string method = ctx->recv_buffer.substr(0, first_space);
+        std::string request_target = ctx->recv_buffer.substr(first_space + 1, second_space - first_space - 1);
+        std::string version = ctx->recv_buffer.substr(second_space + 1, request_line_end - second_space - 1);
+        std::string headers = ctx->recv_buffer.substr(request_line_end + 2, header_end - request_line_end - 2);
+
+        size_t content_length = 0;
+        for (size_t cursor = 0; cursor < headers.size();) {
+            size_t finish = headers.find("\r\n", cursor);
+            if (finish == std::string::npos) finish = headers.size();
+            const std::string line = headers.substr(cursor, finish - cursor);
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string name = line.substr(0, colon);
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+                });
+                if (name == "content-length") {
+                    const char* value = line.c_str() + colon + 1;
+                    while (*value == ' ' || *value == '\t') ++value;
+                    char* end = nullptr;
+                    const unsigned long long parsed = std::strtoull(value, &end, 10);
+                    if (end == value || parsed > 64ull * 1024ull * 1024ull)
+                        return luaL_error(L, "Invalid or oversized HTTP Content-Length");
+                    content_length = static_cast<size_t>(parsed);
+                }
+            }
+            cursor = finish == headers.size() ? headers.size() : finish + 2;
+        }
+
+        const size_t body_start = header_end + 4;
+        // Socket::ReceiveBytes(n) waits for n bytes to be simultaneously
+        // buffered before consuming them. That can deadlock when a request
+        // body is larger than the socket's receive window, so drain whatever
+        // is currently available until Content-Length has been collected.
+        while (ctx->recv_buffer.size() - body_start < content_length) {
+            auto chunk = ctx->sock->ReceiveBytes(0, 1000);
+            if (chunk.empty())
+                return luaL_error(L, "HTTP request body ended before Content-Length");
+            ctx->recv_buffer += chunk;
+        }
+
         lua_newtable(L);
         lua_pushlstring(L, ctx->recv_buffer.c_str(), ctx->recv_buffer.size());
         lua_setfield(L, -2, "data");
-        std::string method = ctx->recv_buffer.substr(0, ctx->recv_buffer.find(' '));
         lua_pushlstring(L, method.c_str(), method.size());
         lua_setfield(L, -2, "method");
-        std::string path = ctx->recv_buffer.substr(ctx->recv_buffer.find(' ') + 1, ctx->recv_buffer.find(' ', ctx->recv_buffer.find(' ') + 1) - ctx->recv_buffer.find(' ') - 1);
-        if (path.find('?') != std::string::npos) {
-            auto query = path.substr(path.find('?') + 1);
+        std::string request_path = request_target;
+        if (request_path.find('?') != std::string::npos) {
+            auto query = request_path.substr(request_path.find('?') + 1);
             lua_pushlstring(L, query.c_str(), query.size());
             lua_setfield(L, -2, "query");
-            path = path.substr(0, path.find('?'));
+            request_path = request_path.substr(0, request_path.find('?'));
         }
-        lua_pushlstring(L, path.c_str(), path.size());
+        lua_pushlstring(L, request_path.c_str(), request_path.size());
         lua_setfield(L, -2, "path");
-        std::string version = ctx->recv_buffer.substr(ctx->recv_buffer.find(' ', ctx->recv_buffer.find(' ') + 1) + 1, ctx->recv_buffer.find("\r\n") - ctx->recv_buffer.find(' ', ctx->recv_buffer.find(' ') + 1) - 1);
         lua_pushlstring(L, version.c_str(), version.size());
         lua_setfield(L, -2, "version");
-        std::string headers = ctx->recv_buffer.substr(ctx->recv_buffer.find("\r\n") + 2, ctx->recv_buffer.find("\r\n\r\n") - ctx->recv_buffer.find("\r\n") - 2);
         lua_newtable(L);
         int i = 1;
-        while (headers.find("\r\n") != std::string::npos) {
-            std::string header = headers.substr(0, headers.find("\r\n"));
+        for (size_t cursor = 0; cursor < headers.size();) {
+            size_t finish = headers.find("\r\n", cursor);
+            if (finish == std::string::npos) finish = headers.size();
+            std::string header = headers.substr(cursor, finish - cursor);
             lua_pushlstring(L, header.c_str(), header.size());
             lua_rawseti(L, -2, i);
-            headers = headers.substr(headers.find("\r\n") + 2);
             i++;
+            cursor = finish == headers.size() ? headers.size() : finish + 2;
         }
         lua_setfield(L, -2, "headers");
-        std::string body = ctx->recv_buffer.substr(ctx->recv_buffer.find("\r\n\r\n") + 4);
+        std::string body = ctx->recv_buffer.substr(body_start, content_length);
         lua_pushlstring(L, body.c_str(), body.size());
         lua_setfield(L, -2, "body");
         return 1;
@@ -1411,7 +1487,7 @@ int luaopen_network(lua_State* L) {
     lua_asyncclass(L);
 
     lua_newtable(L);
-    lua_pushstring(L, "network 0.2.0");
+    lua_pushstring(L, "network 0.3.0");
     lua_setfield(L, -2, "_VERSION");
     lua_newtable(L);
     lua_pushboolean(L, true); lua_setfield(L, -2, "structured_response");
@@ -1419,6 +1495,7 @@ int luaopen_network(lua_State* L) {
     lua_pushboolean(L, true); lua_setfield(L, -2, "request_timeouts");
     lua_pushboolean(L, true); lua_setfield(L, -2, "large_tls_writes");
     lua_pushboolean(L, true); lua_setfield(L, -2, "response_limits");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "listener_bind_address");
     lua_setfield(L, -2, "capabilities");
     lua_pushcfunction(L, WebRequest);
     lua_setfield(L, -2, "send");

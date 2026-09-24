@@ -87,3 +87,11 @@ The existing `get`, `download`, `connect`, `listen`, `async`, `ping`, and
 callback options; set `return_response=true` to receive metadata. `send`
 retains its original body-only return value unless structured output is
 explicitly requested.
+
+Listeners bind to loopback by default. Pass an explicit IPv4 address as the
+third argument to expose a listener on another interface; `0.0.0.0` binds all
+IPv4 interfaces:
+
+```lua
+local server = network.listen(3848, true, "0.0.0.0")
+```

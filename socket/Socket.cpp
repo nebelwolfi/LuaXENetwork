@@ -3,6 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <WS2tcpip.h>
 
 
 using namespace std;
@@ -86,15 +87,23 @@ bool Socket::Closed() {
     return false;
 }
 
-std::string Socket::ReceiveBytes(unsigned long max_recv) {
+std::string Socket::ReceiveBytes(unsigned long max_recv, unsigned long timeoutMs) {
 	std::string ret;
     unsigned long can_recv = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
 
     while (!can_recv || can_recv < max_recv) {
         int ctl = ioctlsocket(s_, FIONREAD, &can_recv);
         if (ctl == SOCKET_ERROR) {
             return "";
         }
+        if (!can_recv) {
+            char probe;
+            const int peek = recv(s_, &probe, 1, MSG_PEEK);
+            if (peek == 0) { closed = true; return ""; }
+            if (peek == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) return "";
+        }
+        if (timeoutMs && std::chrono::steady_clock::now() >= deadline) return "";
         //printf("ioctlsocket returned %d, max_recv = %d\n", ctl, max_recv);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -171,7 +180,7 @@ sockaddr_storage Socket::GetRemote() {
     return sa;
 }
 
-SocketServer::SocketServer(int port, TypeSocket type) {
+SocketServer::SocketServer(int port, TypeSocket type, const std::string& bindAddress) {
 	sockaddr_in sa;
 
 	memset(&sa, 0, sizeof(sa));
@@ -189,20 +198,30 @@ SocketServer::SocketServer(int port, TypeSocket type) {
 		ioctlsocket(s_, FIONBIO, &arg);
 	}
 
-	sa.sin_addr.S_un.S_addr = inet_addr("127.0.0.1");
+	if (inet_pton(AF_INET, bindAddress.c_str(), &sa.sin_addr) != 1) {
+		closesocket(s_);
+		throw std::runtime_error("invalid IPv4 bind address: " + bindAddress);
+	}
 
 	/* bind the socket to the internet address */
 	if (bind(s_, (sockaddr *)&sa, sizeof(sockaddr_in)) == SOCKET_ERROR) {
+		const int error = WSAGetLastError();
 		closesocket(s_);
-		throw "INVALID_SOCKET";
+		throw std::runtime_error("bind failed (Winsock " + std::to_string(error) + ")");
 	}
 
-	listen(s_, SOMAXCONN);
+	if (listen(s_, SOMAXCONN) == SOCKET_ERROR) {
+		const int error = WSAGetLastError();
+		closesocket(s_);
+		throw std::runtime_error("listen failed (Winsock " + std::to_string(error) + ")");
+	}
 
     // find out which port was really used
     int sa_len = sizeof(sa);
     if (getsockname(s_, (sockaddr*)&sa, &sa_len) == -1) {
-        throw "INVALID_SOCKET";
+		const int error = WSAGetLastError();
+		closesocket(s_);
+		throw std::runtime_error("getsockname failed (Winsock " + std::to_string(error) + ")");
     }
     port_ = ntohs(sa.sin_port);
 }
@@ -217,6 +236,10 @@ std::unique_ptr<Socket> SocketServer::Accept() {
 		else {
 			throw "Invalid Socket";
 		}
+	}
+	if (type_ == NonBlockingSocket) {
+		u_long nonblocking = 1;
+		ioctlsocket(new_sock, FIONBIO, &nonblocking);
 	}
 
 	return std::make_unique<Socket>(new_sock);

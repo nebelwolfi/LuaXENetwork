@@ -21,7 +21,7 @@ public:
 	Socket& operator=(Socket&);
 
 	std::string ReceiveLine();
-	std::string ReceiveBytes(unsigned long);
+	std::string ReceiveBytes(unsigned long, unsigned long timeoutMs = 0);
 
 	void   Close();
 
@@ -60,7 +60,8 @@ public:
 
 class SocketServer : public Socket {
 public:
-	SocketServer(int port, TypeSocket type = BlockingSocket);
+	SocketServer(int port, TypeSocket type = BlockingSocket,
+		const std::string& bindAddress = "127.0.0.1");
 
     std::unique_ptr<Socket> Accept();
 
