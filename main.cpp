@@ -1316,6 +1316,12 @@ int Listener_Accept(lua_State *L) {
     auto sock = new (lua::alloc<ListenerContext>(L)) ListenerContext();
     sock->Accept(std::move(usock));
 
+    // pcall pops the socket argument; keep a reference below the function so the
+    // userdata can't be collected (and freed) while we still use `sock` below.
+    // [2] = socket, [3] = func, [4] = socket
+    lua_pushvalue(L, -1);
+    lua_insert(L, 2);
+
     if (lua::pcall(L, 1, LUA_MULTRET)) {
         if (sock->onError != LUA_REFNIL) {
             lua_rawgeti(L, LUA_REGISTRYINDEX, sock->onError);
@@ -1330,10 +1336,11 @@ int Listener_Accept(lua_State *L) {
         }
     }
 
-    if (lua_gettop(L) > 1) {
+    if (lua_gettop(L) > 2) {
         // lua stack:
         // [1] = socketserver
-        // [2] = result
+        // [2] = socket
+        // [3] = result
         if (lua_istable(L, -1)) {
             sock->SendBytes(ResponseBuilder(L, -1));
         } else if (lua_isstring(L, -1)) {
