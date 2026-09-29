@@ -73,7 +73,12 @@ std::string RequestBuilder(lua_State *L, std::string host, int idx = -1) {
         request += "Content-Length: ";
         request += std::to_string(lua_objlen(L, -1));
         request += "\r\n\r\n";
-        request += lua_tostring(L, -1);
+        {
+            // binary-safe: bodies may contain NUL bytes (Content-Length above is the full length)
+            size_t body_len = 0;
+            const char *body = lua_tolstring(L, -1, &body_len);
+            request.append(body, body_len);
+        }
     } else {
         request += "\r\n";
     }
@@ -117,7 +122,12 @@ std::string ResponseBuilder(lua_State *L, int idx = 1) {
         request += "Content-Length: ";
         request += std::to_string(lua_objlen(L, -1));
         request += "\r\n\r\n";
-        request += lua_tostring(L, -1);
+        {
+            // binary-safe: bodies may contain NUL bytes (Content-Length above is the full length)
+            size_t body_len = 0;
+            const char *body = lua_tolstring(L, -1, &body_len);
+            request.append(body, body_len);
+        }
     } else {
         request += "\r\n";
     }
