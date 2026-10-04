@@ -67,3 +67,8 @@ DialedConnection Dial(const DialOptions& options, HANDLE shutdown_event);
 
 // "[code] message" for a WSA error code.
 std::string DialErrorText(const std::wstring& host, unsigned short port, DWORD wsa_error);
+
+// "socks5://[user:pass@]host:port" or "socks5h://...". socks5h sends the target
+// name to the proxy (remote DNS); socks5 resolves it here. Throws DialError with
+// the code "proxy_url_invalid" - a malformed proxy is never ignored.
+ProxyTarget ParseProxyUrl(const std::string& url);

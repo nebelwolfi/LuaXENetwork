@@ -112,29 +112,33 @@ $leafRogue = New-Leaf -Name 'leaf-rogue' -Subject 'localhost' -San 'DNS:localhos
 
 # ---- TLS servers (openssl s_server children) --------------------------------
 
+# A port that is free right now may be the one the previous server just took:
+# Windows happily hands back the port it released a moment ago, which would put
+# two s_server processes on one port (the second can never bind). Handed-out
+# ports are therefore never reused.
+$script:usedPorts = New-Object System.Collections.Generic.HashSet[int]
+
 function Get-FreePort {
-    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
-    $listener.Start()
-    $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
-    $listener.Stop()
-    return $port
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $listener.Stop()
+        if ($script:usedPorts.Add($port)) { return $port }
+    }
+    throw 'could not find a free port for a TLS server'
 }
 
 function Start-TlsServer {
     param([string]$Role, [int]$Port, $Certificate)
     $arguments = @('s_server', '-accept', "$Port", '-cert', $Certificate.Cert, '-key', $Certificate.Key,
-        '-tls1_2', '-www', '-naccept', '2000', '-quiet')
-    $process = Start-Process -FilePath $openssl -ArgumentList $arguments -PassThru -NoNewWindow `
-        -RedirectStandardOutput (Join-Path $workFull ($Role + '.tls.out')) `
-        -RedirectStandardError (Join-Path $workFull ($Role + '.tls.err'))
-    [void]$children.Add([pscustomobject]@{ Role = $Role; Process = $process })
+        '-tls1_2', '-www', '-naccept', '100000', '-quiet')
+    $supervisor = New-Object Tb287+TlsSupervisor($Role, $openssl, $arguments, $Port, $workFull)
+    [void]$children.Add([pscustomobject]@{ Role = $Role; Id = $supervisor.ProcessId; Port = $Port })
+    [void]$owned.Add($supervisor)
     # Wait until it accepts, so the test never races the listener.
     $deadline = (Get-Date).AddSeconds(20)
     while ((Get-Date) -lt $deadline) {
-        if ($process.HasExited) {
-            $why = Get-Content -Raw -LiteralPath (Join-Path $workFull ($Role + '.tls.err'))
-            throw ("openssl s_server for " + $Role + " exited: " + $why)
-        }
         $probe = New-Object System.Net.Sockets.TcpClient
         try { $probe.Connect('127.0.0.1', $Port); $probe.Close(); return $Port }
         catch { try { $probe.Close() } catch { }; Start-Sleep -Milliseconds 100 }
@@ -153,8 +157,10 @@ function Test-PortFree {
 $code = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -266,6 +272,106 @@ public static class Tb287
         public void Dispose() { stopping = true; try { listener.Stop(); } catch { } }
     }
 
+    // ---- TLS server supervision ---------------------------------------------
+    //
+    // openssl s_server handles one connection at a time, and a client that walks
+    // away mid-handshake (every rejected-certificate check does exactly that)
+    // leaves it busy: every later connection then times out and a good check
+    // fails for the wrong reason. A TLS client can be built in .NET even though
+    // a TLS *server* cannot (the private-key problem), so this probes each server
+    // once a second and restarts one that stops answering, on the same port.
+    public sealed class TlsSupervisor : IDisposable
+    {
+        readonly string role;
+        readonly string executable;
+        readonly string[] arguments;
+        readonly int port;
+        public readonly string Directory;
+        Process process;
+        volatile bool stopping;
+        Thread thread;
+
+        public TlsSupervisor(string role, string executable, string[] arguments, int port, string work)
+        {
+            this.role = role;
+            this.executable = executable;
+            this.arguments = arguments;
+            this.port = port;
+            Directory = work;
+            process = Start();
+            thread = new Thread(Watch) { IsBackground = true, Name = role + "-watch" };
+            thread.Start();
+        }
+
+        // The current child's pid, for the runner's leftover check.
+        public int ProcessId { get { try { return process.Id; } catch { return 0; } } }
+
+        Process Start()
+        {
+            var log = Path.Combine(Directory, role + ".s_server.log");
+            var started = new ProcessStartInfo(executable, string.Join(" ", arguments))
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            var child = Process.Start(started);
+            // Its diagnostics go to a file: a server that will not start is
+            // otherwise invisible.
+            child.ErrorDataReceived += (sender, e) =>
+            {
+                if (e.Data == null) return;
+                try { File.AppendAllText(log, e.Data + "\r\n"); } catch { }
+            };
+            child.BeginErrorReadLine();
+            return child;
+        }
+
+        // A liveness probe, nothing more: a TLS handshake here would take the
+        // server's single connection slot and collide with the test that is
+        // running right now - which is exactly the failure this supervisor is
+        // meant to prevent.
+        static bool Answers(int port)
+        {
+            try
+            {
+                using (var client = new TcpClient())
+                {
+                    client.ReceiveTimeout = 1000;
+                    client.Connect(IPAddress.Loopback, port);
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        void Watch()
+        {
+            while (!stopping)
+            {
+                Thread.Sleep(2000);
+                if (stopping) return;
+                if (Answers(port)) continue;
+                // One failure is enough: a server that stopped listening will
+                // not come back on its own.
+                try
+                {
+                    if (!process.HasExited) process.Kill();
+                }
+                catch { }
+                try { process = Start(); } catch { }
+                Thread.Sleep(500);
+            }
+        }
+
+        public void Dispose()
+        {
+            stopping = true;
+            try { if (process != null && !process.HasExited) process.Kill(); } catch { }
+        }
+    }
+
     public sealed class Socks : IDisposable
     {
         readonly TcpListener listener;
@@ -306,25 +412,28 @@ public static class Tb287
             }
         }
 
-        static bool Exact(TcpClient client, byte[] wanted)
+        // Fills `wanted` with exactly that many bytes. Returns false on a close or on
+// a receive timeout. (It must NOT compare what it read: the caller owns the
+// expected content.)
+static bool Read(TcpClient client, byte[] wanted)
         {
             client.ReceiveTimeout = 8000;
-            var got = new byte[wanted.Length];
             int read = 0;
             while (read < wanted.Length)
             {
-                int n = client.GetStream().Read(got, read, wanted.Length - read);
-                if (n <= 0) return false;
+                int n;
+                try { n = client.GetStream().Read(wanted, read, wanted.Length - read); }
+                catch { return false; }      // a receive timeout or a reset
+                if (n <= 0) return false;    // the peer closed
                 read += n;
             }
-            for (int i = 0; i < wanted.Length; i++) if (got[i] != wanted[i]) return false;
             return true;
         }
 
         void Report(string line)
         {
             if (ReportPath == "") return;
-            try { File.WriteAllText(ReportPath, line); } catch { }
+            try { File.AppendAllText(ReportPath, line + "\r\n"); } catch { }
         }
 
         void Handle(TcpClient client)
@@ -335,12 +444,26 @@ public static class Tb287
                 client.ReceiveTimeout = 8000;
                 client.SendTimeout = 8000;
                 var stream = client.GetStream();
-                if (Silent) return;   // accept and go quiet: the client must time out
+                if (Silent)
+                {
+                    // Accept and say nothing at all until the client gives up.
+                    Thread.Sleep(20000);
+                    return;
+                }
 
                 byte[] greeting = new byte[2];
-                if (!Exact(client, greeting)) return;
-                int methodCount = stream.ReadByte();
-                if (methodCount < 0) return;
+                if (!Read(client, greeting))
+                {
+                    try
+                    {
+                        File.AppendAllText(Path.Combine(Path.GetDirectoryName(ReportPath), "errors.txt"),
+                            Role + ": greeting unreadable\r\n");
+                    }
+                    catch { }
+                    return;
+                }
+                // greeting is VER | NMETHODS; the method list follows.
+                int methodCount = greeting[1];
                 var methods = new byte[methodCount];
                 int read = 0;
                 while (read < methodCount)
@@ -352,18 +475,22 @@ public static class Tb287
                 bool hasNoAuth = Array.IndexOf(methods, (byte)0x00) >= 0;
                 bool hasUserPass = Array.IndexOf(methods, (byte)0x02) >= 0;
                 byte chosen;
-                if (MethodReply == 0xFF) chosen = 0xFF;
+                if (MethodReply != 0x00) chosen = MethodReply;   // this proxy offers only this
                 else if (hasUserPass && Password != null) chosen = 0x02;
                 else if (hasNoAuth) chosen = 0x00;
-                else chosen = MethodReply;
+                else chosen = 0xFF;
+                // The method reply is VER | METHOD: two bytes.
+                stream.WriteByte(0x05);
                 stream.WriteByte(chosen);
                 stream.Flush();
+                Report("greeting " + greeting[0].ToString("x2") + greeting[1].ToString("x2")
+                    + " methods=" + methodCount + " chose=" + chosen.ToString("x2"));
                 if (chosen == 0xFF) return;
                 if (CloseAfterGreeting) return;   // a proxy that drops the connection
                 if (chosen == 0x02)
                 {
                     var version = new byte[1];      // RFC 1929
-                    if (!Exact(client, version)) return;
+                    if (!Read(client, version)) return;
                     int userLength = stream.ReadByte();
                     if (userLength < 0) return;
                     var user = new byte[userLength];
@@ -387,6 +514,8 @@ public static class Tb287
                     string gotUser = Encoding.UTF8.GetString(user);
                     string gotPass = Encoding.UTF8.GetString(pass);
                     bool ok = gotUser == (User ?? "") && gotPass == (Password ?? "") && ReplyCode == 0;
+                    // The RFC 1929 reply is VER | STATUS: two bytes.
+                    stream.WriteByte(0x01);
                     stream.WriteByte(ok ? (byte)0x00 : (byte)0x01);
                     stream.Flush();
                     Report((ok ? "auth-ok " : "auth-failed ") + gotUser + " plen=" + gotPass.Length);
@@ -394,14 +523,14 @@ public static class Tb287
                 }
 
                 byte[] request = new byte[4];       // CONNECT
-                if (!Exact(client, request)) return;
+                if (!Read(client, request)) return;
                 if (request[1] != 0x01) { WriteReply(stream, 0x07); return; }
                 byte atyp = request[3];
                 string address = "";
                 if (atyp == 0x01)
                 {
                     var raw = new byte[4];
-                    if (!Exact(client, raw)) return;
+                    if (!Read(client, raw)) return;
                     address = new IPAddress(raw).ToString();
                 }
                 else if (atyp == 0x03)
@@ -421,12 +550,12 @@ public static class Tb287
                 else if (atyp == 0x04)
                 {
                     var raw = new byte[16];
-                    if (!Exact(client, raw)) return;
+                    if (!Read(client, raw)) return;
                     address = new IPAddress(raw).ToString();
                 }
                 else { WriteReply(stream, 0x08); return; }
                 var portBytes = new byte[2];
-                if (!Exact(client, portBytes)) return;
+                if (!Read(client, portBytes)) return;
                 int targetPort = (portBytes[0] << 8) | portBytes[1];
                 LastRequest = atyp + " " + address + " " + targetPort;
                 Report("connect " + LastRequest);
@@ -500,11 +629,13 @@ function Add-Recorder {
 
 function Add-Socks {
     param([string]$Role, [int]$ForwardPort, [byte]$ReplyCode = 0, [bool]$NoMethods = $false,
-        [bool]$CloseAfterGreeting = $false, [bool]$Silent = $false, [string]$User = '', [string]$Password = '')
+        [bool]$CloseAfterGreeting = $false, [bool]$Silent = $false, [string]$User = '', [string]$Password = '',
+        [byte]$OnlyMethod = 0)
     $socks = New-Object Tb287+Socks($Role, 0)
     $socks.ForwardPort = $ForwardPort
     $socks.ReplyCode = $ReplyCode
     if ($NoMethods) { $socks.MethodReply = [byte]0xFF }
+    if ($OnlyMethod -ne 0) { $socks.MethodReply = $OnlyMethod }
     $socks.CloseAfterGreeting = $CloseAfterGreeting
     $socks.Silent = $Silent
     $socks.User = $User
@@ -539,9 +670,13 @@ try {
     }
 
     $socksOpen = Add-Socks -Role 'socks-open' -ForwardPort $plain.Port
-    $socksAuth = Add-Socks -Role 'socks-auth' -ForwardPort $plain.Port -User 'user' -Password 'pass'
+    $socksAuth = Add-Socks -Role 'socks-auth' -ForwardPort $plain.Port -User 'user' -Password 'pass' -OnlyMethod 2
     $socksSilent = Add-Socks -Role 'socks-silent' -Silent $true
     $socksSecure = Add-Socks -Role 'socks-secure' -ForwardPort $securePort
+    # A second proxy whose upstream is the rogue-CA server: the certificate
+    # rejection check needs its own, because an aborted handshake leaves that one
+    # server busy.
+    $socksRogue = Add-Socks -Role 'socks-rogue' -ForwardPort $roguePort
     $socksNoMethod = Add-Socks -Role 'socks-nomethod' -ForwardPort $plain.Port -NoMethods $true
     $socksClose = Add-Socks -Role 'socks-close' -ForwardPort $plain.Port -CloseAfterGreeting $true
 
@@ -563,6 +698,7 @@ try {
         socks_auth_port = $socksAuth.Port
         socks_silent_port = $socksSilent.Port
         socks_secure_port = $socksSecure.Port
+        socks_rogue_port = $socksRogue.Port
         socks_nomethod_port = $socksNoMethod.Port
         socks_close_port = $socksClose.Port
         socks_replies = $socksReplies

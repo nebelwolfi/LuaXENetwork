@@ -32,9 +32,10 @@ public:
 
     // SChannel skips the hook entirely when the peer never sends a certificate,
     // so "checked" has to be asserted by the caller: a verification that never
-    // ran is a failure, not a pass.
+    // ran is a failure, not a pass. That is also why Passed() requires it - a
+    // handshake that broke before the certificate arrived did not accept it.
     bool Checked() const { return checked; }
-    bool Passed() const { return !failed; }
+    bool Passed() const { return checked && !failed; }
 
     // Stable machine-readable reason, e.g. "tls_untrusted_root".
     const std::string& Code() const { return code; }

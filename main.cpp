@@ -225,6 +225,10 @@ static HttpRequestOptions ReadRequestOptions(lua_State* L, int index) {
     options.ca_file = RequestString(L, index, "ca_file");
     options.tls_verify = RequestBoolean(L, index, "tls_verify", true);
     options.tls_check_revocation = RequestBoolean(L, index, "tls_revoke", true);
+    // TB-287: a malformed proxy URL is an error here, before a socket is opened:
+    // silently ignoring it would send the request straight to the target.
+    const std::string proxy_url = RequestString(L, index, "proxy");
+    if (!proxy_url.empty()) options.proxy = ParseProxyUrl(proxy_url);
     const std::string sni = RequestString(L, index, "sni");
     if (!sni.empty()) options.sni = utf8_decode_lua(sni);
     options.connect_timeout_ms = std::max(1000, options.connect_timeout_ms);
@@ -232,6 +236,19 @@ static HttpRequestOptions ReadRequestOptions(lua_State* L, int index) {
     options.receive_timeout_ms = std::max(1000, options.receive_timeout_ms);
     options.total_timeout_ms = std::max(0, options.total_timeout_ms);
     return options;
+}
+
+// Reads the option table. A malformed proxy URL throws a DialError here, before
+// any socket exists; it becomes a Lua error here, because a C++ exception must
+// never reach the Lua boundary (it would surface as "C++ exception").
+static HttpRequestOptions ReadOptions(lua_State* L, int index) {
+    try {
+        return ReadRequestOptions(L, index);
+    } catch (const DialError& error) {
+        luaL_error(L, "%s", error.what());
+    } catch (const std::exception& error) {
+        luaL_error(L, "%s", error.what());
+    }
 }
 
 static int TimeoutSeconds(int milliseconds) {
@@ -582,7 +599,7 @@ static int WebRequestImpl(lua_State* L, bool force_response_table) {
 
     const int builder_index = request_index ? request_index : lua_gettop(L);
     const std::string RequestString = RequestBuilder(L, HostA + ":" + std::to_string(Port), builder_index);
-    HttpRequestOptions options = ReadRequestOptions(L, request_index);
+    HttpRequestOptions options = ReadOptions(L, request_index);
     if (force_response_table) options.return_response = true;
     try {
         const HttpResponse response = ResolveHttpRequest(L, HostW, Port, RequestString, options);
@@ -649,7 +666,7 @@ static int WebRequest_SimpleGET(lua_State *L) {
     try {
         const ParsedHttpUrl target = ParseHttpUrl(luaL_checkstring(L, 1));
         const int options_index = lua_istable(L, 2) ? 2 : 0;
-        HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        HttpRequestOptions options = ReadOptions(L, options_index);
         // The scheme decides unless the caller said otherwise: `ssl` wins, so
         // network.get("http://x/", {ssl = true}) really is TLS.
         if (!options.ssl) options.ssl = target.ssl;
@@ -671,7 +688,7 @@ static int WebRequest_SimpleDownload(lua_State *L) {
         const ParsedHttpUrl target = ParseHttpUrl(luaL_checkstring(L, 1));
         const std::filesystem::path local_path = luaL_checkstring(L, 2);
         const int options_index = lua_istable(L, 3) ? 3 : 0;
-        HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        HttpRequestOptions options = ReadOptions(L, options_index);
         // The scheme decides unless the caller said otherwise (see get above).
         if (!options.ssl) options.ssl = target.ssl;
         const std::string request = "GET " + target.path
@@ -980,7 +997,7 @@ public:
 
         // TB-287: the same options, the same dial path and the same certificate
         // verification as an HTTP request. TLS comes from `ssl`, not from 443.
-        HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        HttpRequestOptions options = ReadOptions(L, options_index);
         DialOptions dial;
         dial.host = HostW;
         dial.port = static_cast<unsigned short>(Port);
@@ -1411,6 +1428,7 @@ int luaopen_network(lua_State* L) {
     lua_pushboolean(L, true); lua_setfield(L, -2, "tls_verify");
     lua_pushboolean(L, true); lua_setfield(L, -2, "ca_file");
     lua_pushboolean(L, true); lua_setfield(L, -2, "sni_override");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "proxy_socks5");
     lua_setfield(L, -2, "capabilities");
     lua_pushcfunction(L, WebRequest);
     lua_setfield(L, -2, "send");

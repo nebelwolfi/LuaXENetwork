@@ -56,6 +56,283 @@ int Remaining(const DialOptions& options, std::chrono::steady_clock::time_point 
 
 } // namespace
 
+// ---- SOCKS5 (RFC 1928 greeting, RFC 1929 authentication, CONNECT) ------------
+
+namespace {
+
+std::string LowerAscii(std::string text)
+{
+    for (char& character : text)
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    return text;
+}
+
+std::wstring WideFromUtf8(const std::string& text)
+{
+    if (text.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (size <= 0) return {};
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), wide.data(), size);
+    return wide;
+}
+
+int HexDigit(char character)
+{
+    if (character >= '0' && character <= '9') return character - '0';
+    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+    if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+    return -1;
+}
+
+std::string PercentDecode(const std::string& text)
+{
+    std::string out;
+    for (size_t index = 0; index < text.size(); ++index) {
+        if (text[index] != '%') { out += text[index]; continue; }
+        if (index + 2 >= text.size())
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] truncated escape in the proxy credentials");
+        const int high = HexDigit(text[index + 1]);
+        const int low = HexDigit(text[index + 2]);
+        if (high < 0 || low < 0)
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] bad escape sequence in the proxy credentials");
+        out += static_cast<char>((high << 4) | low);
+        index += 2;
+    }
+    return out;
+}
+
+void SendAll(CActiveSock& socket, const std::string& bytes, const char* what)
+{
+    const int sent = socket.Send(bytes.data(), bytes.size());
+    if (sent != static_cast<int>(bytes.size()))
+        throw DialError("proxy_protocol_error",
+            std::string("[proxy_protocol_error] could not send the ") + what + " to the SOCKS5 proxy ("
+            + std::to_string(sent) + " of " + std::to_string(bytes.size()) + " bytes, error "
+            + std::to_string(socket.GetLastError()) + ")");
+}
+
+// Exactly `count` bytes, or a failure that says which one it was.
+std::string RecvExact(CActiveSock& socket, size_t count, const char* what)
+{
+    std::string buffer(count, '\0');
+    const int received = socket.Recv(buffer.data(), count, count);
+    if (received == SOCKET_ERROR) {
+        const DWORD error = socket.GetLastError();
+        if (error == ERROR_TIMEOUT || error == WSAETIMEDOUT)
+            throw DialError("proxy_timeout", std::string("[proxy_timeout] the SOCKS5 proxy did not send the ")
+                + what + " in time");
+        throw DialError("proxy_closed", std::string("[proxy_closed] the SOCKS5 proxy closed the connection during the ")
+            + what);
+    }
+    if (static_cast<size_t>(received) != count)
+        throw DialError("proxy_closed", std::string("[proxy_closed] the SOCKS5 proxy closed the connection during the ")
+            + what + " (" + std::to_string(received) + " of " + std::to_string(count)
+            + " bytes, error " + std::to_string(socket.GetLastError()) + ")");
+    return buffer;
+}
+
+std::string ReplyText(unsigned char code)
+{
+    switch (code) {
+    case 0x01: return "the SOCKS5 proxy reported a general failure";
+    case 0x02: return "the SOCKS5 proxy refused this connection (not allowed by ruleset)";
+    case 0x03: return "the SOCKS5 proxy reported the network as unreachable";
+    case 0x04: return "the SOCKS5 proxy could not reach the host (its own DNS or route failed)";
+    case 0x05: return "the target refused the connection through the SOCKS5 proxy";
+    case 0x06: return "the SOCKS5 proxy reported the TTL expired";
+    case 0x07: return "the SOCKS5 proxy does not support the CONNECT command";
+    case 0x08: return "the SOCKS5 proxy does not support the address type asked for";
+    default: return "the SOCKS5 proxy answered with an unknown reply code " + std::to_string(code);
+    }
+}
+
+std::string ReplyCode(unsigned char code)
+{
+    switch (code) {
+    case 0x01: return "proxy_general_failure";
+    case 0x02: return "proxy_not_allowed";
+    case 0x03: return "proxy_network_unreachable";
+    case 0x04: return "proxy_host_unreachable";
+    case 0x05: return "proxy_target_refused";
+    case 0x06: return "proxy_ttl_expired";
+    case 0x07: return "proxy_command_unsupported";
+    case 0x08: return "proxy_address_type_unsupported";
+    default: return "proxy_reply_unknown";
+    }
+}
+
+// The target address the CONNECT carries: a name for socks5h (the proxy resolves
+// it), a locally resolved address for socks5.
+std::string ConnectRequest(const ProxyTarget& target, const std::wstring& host, unsigned short port)
+{
+    std::string request;
+    request += static_cast<char>(0x05);   // version
+    request += static_cast<char>(0x01);   // CONNECT
+    request += static_cast<char>(0x00);   // reserved
+    if (target.remote_dns) {
+        const std::string name = Utf8(host);
+        if (name.empty() || name.size() > 255)
+            throw DialError("proxy_url_invalid", "proxy_url_invalid: the target host name is not 1-255 bytes");
+        request += static_cast<char>(0x03);   // domain name
+        request += static_cast<char>(name.size());
+        request += name;
+    } else {
+        // socks5: the address goes on the wire in binary, not as text.
+        char buffer[16] = { 0 };
+        IN_ADDR v4{};
+        if (InetPtonW(AF_INET, host.c_str(), &v4)) {
+            request += static_cast<char>(0x01);
+            request.append(reinterpret_cast<const char*>(&v4), 4);
+        } else {
+            IN6_ADDR v6{};
+            if (!InetPtonW(AF_INET6, host.c_str(), &v6))
+                throw DialError("proxy_dns_failed",
+                    "[proxy_dns_failed] could not resolve " + Endpoint(host, port));
+            request += static_cast<char>(0x04);
+            request.append(reinterpret_cast<const char*>(&v6), 16);
+        }
+    }
+    request += static_cast<char>((port >> 8) & 0xFF);
+    request += static_cast<char>(port & 0xFF);
+    return request;
+}
+
+void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::wstring& host,
+    unsigned short port)
+{
+    const std::string where = "the SOCKS5 proxy at " + Utf8(target.host) + ":" + std::to_string(target.port);
+
+    // 1. method negotiation
+    std::string greeting;
+    greeting += static_cast<char>(0x05);
+    if (target.has_credentials) {
+        greeting += static_cast<char>(0x02);
+        greeting += static_cast<char>(0x00);
+        greeting += static_cast<char>(0x02);
+    } else {
+        greeting += static_cast<char>(0x01);
+        greeting += static_cast<char>(0x00);
+    }
+    SendAll(socket, greeting, "method list");
+    const std::string choice = RecvExact(socket, 2, "method reply");
+    if (static_cast<unsigned char>(choice[0]) != 0x05)
+        throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " is not SOCKS5");
+    if (static_cast<unsigned char>(choice[1]) == 0xFF)
+        throw DialError("proxy_no_acceptable_auth",
+            "[proxy_no_acceptable_auth] " + where + " accepts no authentication method this client offers");
+    if (static_cast<unsigned char>(choice[1]) != 0x00 && static_cast<unsigned char>(choice[1]) != 0x02)
+        throw DialError("proxy_no_acceptable_auth",
+            "[proxy_no_acceptable_auth] " + where + " chose an authentication method this client does not support");
+
+    // 2. RFC 1929 username/password, only when the proxy picked it
+    if (static_cast<unsigned char>(choice[1]) == 0x02) {
+        if (!target.has_credentials)
+            throw DialError("proxy_no_acceptable_auth",
+                "[proxy_no_acceptable_auth] " + where + " requires a username and password, and none were given");
+        std::string authentication;
+        authentication += static_cast<char>(0x01);
+        authentication += static_cast<char>(target.user.size());
+        authentication += target.user;
+        authentication += static_cast<char>(target.password.size());
+        authentication += target.password;
+        SendAll(socket, authentication, "credentials");
+        const std::string verdict = RecvExact(socket, 2, "authentication reply");
+        if (static_cast<unsigned char>(verdict[1]) != 0x00)
+            // Deliberately says nothing about the values: credentials never
+            // appear in an error message.
+            throw DialError("proxy_auth_failed",
+                "[proxy_auth_failed] " + where + " rejected the supplied username and password");
+    }
+
+    // 3. CONNECT and the whole reply, including the bound address
+    SendAll(socket, ConnectRequest(target, host, port), "CONNECT request");
+    const std::string header = RecvExact(socket, 4, "CONNECT reply");
+    if (static_cast<unsigned char>(header[0]) != 0x05)
+        throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " answered a CONNECT with a bad version");
+    const unsigned char code = static_cast<unsigned char>(header[1]);
+    if (code != 0x00)
+        throw DialError(ReplyCode(code), "[" + ReplyCode(code) + "] " + where + ": " + ReplyText(code));
+    size_t address_length = 0;
+    switch (static_cast<unsigned char>(header[3])) {
+    case 0x01: address_length = 4; break;
+    case 0x04: address_length = 16; break;
+    case 0x03: {
+        const std::string length = RecvExact(socket, 1, "CONNECT reply");
+        address_length = static_cast<unsigned char>(length[0]);
+        break;
+    }
+    default:
+        throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " answered with an unknown address type");
+    }
+    RecvExact(socket, address_length, "CONNECT reply");   // the bound address
+    RecvExact(socket, 2, "CONNECT reply");                // the bound port
+}
+
+} // namespace
+
+ProxyTarget ParseProxyUrl(const std::string& url)
+{
+    const std::string lowered = LowerAscii(url);
+    ProxyTarget target;
+    if (lowered.starts_with("socks5h://")) {
+        target.remote_dns = true;
+    } else if (lowered.starts_with("socks5://")) {
+        target.remote_dns = false;
+    } else {
+        throw DialError("proxy_url_invalid",
+            "[proxy_url_invalid] the proxy must be socks5:// or socks5h://");
+    }
+    std::string rest = url.substr(lowered.starts_with("socks5h://") ? 10 : 9);
+
+    const size_t at = rest.find('@');
+    if (at != std::string::npos) {
+        if (rest.find('@', at + 1) != std::string::npos)
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy URL has more than one '@'");
+        const std::string userinfo = rest.substr(0, at);
+        rest = rest.substr(at + 1);
+        const size_t colon = userinfo.find(':');
+        target.user = PercentDecode(colon == std::string::npos ? userinfo : userinfo.substr(0, colon));
+        target.password = colon == std::string::npos ? std::string() : PercentDecode(userinfo.substr(colon + 1));
+        if (target.user.empty() || target.user.size() > 255 || target.password.size() > 255)
+            throw DialError("proxy_url_invalid",
+                "[proxy_url_invalid] the proxy user name and password must each be 1-255 bytes");
+        target.has_credentials = true;
+    }
+
+    std::string authority;
+    if (!rest.empty() && rest[0] == '[') {   // [::1]:1080
+        const size_t closing = rest.find(']');
+        if (closing == std::string::npos)
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] the bracketed proxy host is not closed");
+        authority = rest.substr(1, closing - 1);
+        rest = rest.substr(closing + 1);
+        if (rest.empty() || rest[0] != ':')
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy URL has no port");
+    } else {
+        const size_t colon = rest.rfind(':');
+        if (colon == std::string::npos)
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy URL has no port");
+        authority = rest.substr(0, colon);
+        rest = rest.substr(colon);
+    }
+
+    const std::string port_text = rest.substr(1);
+    if (port_text.empty() || port_text.size() > 5)
+        throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy port is missing or malformed");
+    unsigned long port = 0;
+    for (const char digit : port_text) {
+        if (digit < '0' || digit > '9')
+            throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy port is not a number");
+        port = port * 10 + static_cast<unsigned long>(digit - '0');
+    }
+    if (authority.empty() || port == 0 || port > 65535)
+        throw DialError("proxy_url_invalid", "[proxy_url_invalid] the proxy host or port is out of range");
+    target.host = WideFromUtf8(authority);
+    target.port = static_cast<unsigned short>(port);
+    return target;
+}
+
 std::string DialErrorText(const std::wstring& host, unsigned short port, DWORD wsa_error)
 {
     const char* text = "connection failed";
@@ -85,7 +362,17 @@ DialedConnection Dial(const DialOptions& options, HANDLE shutdown_event)
     socket->SetSendTimeoutSeconds(Seconds(connect_timeout));
     socket->SetRecvTimeoutSeconds(Seconds(connect_timeout));
 
-    if (!socket->Connect(options.host.c_str(), options.port)) {
+    // The proxy is dialled instead of the target, and the target address is then
+    // handed to it. There is no direct connection after a proxy failure: a proxy
+    // that cannot be used is an error, never a reason to go around it.
+    if (options.proxy) {
+        const ProxyTarget& proxy = *options.proxy;
+        if (!socket->Connect(proxy.host.c_str(), proxy.port)) {
+            const DWORD code = socket->GetLastError();
+            throw DialError("proxy_connect_refused", DialErrorText(proxy.host, proxy.port, code));
+        }
+        Socks5Handshake(*socket, proxy, options.host, options.port);
+    } else if (!socket->Connect(options.host.c_str(), options.port)) {
         const DWORD code = socket->GetLastError();
         throw DialError("connect_failed", DialErrorText(options.host, options.port, code));
     }
@@ -115,15 +402,15 @@ DialedConnection Dial(const DialOptions& options, HANDLE shutdown_event)
     // than reach a destroyed object.
     tls->ServerCertAcceptable = nullptr;
     if (FAILED(result)) {
-        // A rejected certificate is reported with the verifier's own reason, not
-        // with the SChannel HRESULT, which never says what was wrong. A
-        // certificate that was checked and ACCEPTED and then failed the handshake
-        // is not a verification failure, so only !Passed() comes here.
-        if (!verifier.Passed())
+        // A certificate that was checked and REJECTED is reported with the
+        // verifier's own reason. A handshake that broke before any certificate
+        // arrived, or that failed after an accepted one, is an SSPI failure: it
+        // says nothing about trust, so it must not be dressed up as one.
+        if (verifier.Checked() && !verifier.Passed())
             throw DialError(verifier.Code().empty() ? "tls_handshake_failed" : verifier.Code(),
                 verifier.Message());
         throw DialError("tls_handshake_failed", "[tls_handshake_failed] " + Endpoint(server_name, options.port)
-            + ": TLS handshake failed after the certificate was accepted (SSPI 0x" + [&] {
+            + ": TLS handshake failed (SSPI 0x" + [&] {
                 char text[16] = { 0 };
                 sprintf_s(text, "%08x", tls->LastSecurityStatus());
                 return std::string(text);
