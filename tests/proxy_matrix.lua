@@ -84,11 +84,32 @@ end
 
 -- 3. socks5h hands the NAME to the proxy instead.
 do
-    local ok = request("localhost", ports.plain_port,
+    local ok, response = request("localhost", ports.plain_port,
         { proxy = "socks5h://127.0.0.1:" .. ports.socks_open_port })
-    check("socks5h succeeds with a hostname", ok, ok)
+    check("socks5h succeeds with a hostname", ok and response.status == 200, response)
     check("socks5h sends the name (ATYP 3)",
         proxy_report("socks-open", "connect 3 localhost ") ~= "", proxy_report("socks-open", "connect "))
+end
+
+-- 3b. socks5 is the other way round: the NAME is resolved here and the address is
+--     what goes on the wire. Before, only an IP literal worked at all here and
+--     every host name failed with proxy_dns_failed.
+do
+    local ok, response = request("localhost", ports.plain_port,
+        { proxy = proxy_url(ports.socks_open_port) })
+    check("socks5 resolves a host name locally", ok and response.status == 200, response)
+    check("socks5 sends the resolved address, not the name",
+        proxy_report("socks-open", "connect ") == "connect 1 127.0.0.1 " .. ports.plain_port,
+        proxy_report("socks-open", "connect "))
+    expect_error("a name that does not resolve is reported", "no-such-host.invalid", ports.plain_port,
+        { proxy = proxy_url(ports.socks_open_port) }, "[proxy_dns_failed]")
+end
+
+-- 3c. A socks5h target name has to fit RFC 1928's one-octet length.
+do
+    expect_error("a target name over 255 bytes is refused", string.rep("a", 256) .. ".invalid",
+        ports.plain_port, { proxy = "socks5h://127.0.0.1:" .. ports.socks_open_port },
+        "[proxy_target_name_invalid]")
 end
 
 -- 4. Credentials, and their absence.
@@ -142,6 +163,15 @@ do
         { proxy = proxy_url(ports.socks_close_port) }, "[proxy_closed]")
     expect_error("a silent proxy times out", "127.0.0.1", ports.plain_port,
         { proxy = proxy_url(ports.socks_silent_port), connect_timeout_ms = 1000 }, "[proxy_timeout]")
+    -- The caller's total budget bounds the whole handshake, not only the TCP
+    -- connect: without it the wait is one connect_timeout (6 s here) per step.
+    local started = os.clock()
+    expect_error("a silent proxy cannot outlive total_timeout_ms", "127.0.0.1", ports.plain_port,
+        { proxy = proxy_url(ports.socks_silent_port), connect_timeout_ms = 6000,
+          total_timeout_ms = 1000 }, "[proxy_")
+    local elapsed = os.clock() - started
+    check("total_timeout_ms ended the handshake early", elapsed < 4,
+        string.format("%.1f s elapsed, under 4 s is the point", elapsed))
     -- Nothing listens on a port the fixture never opened, so every request that
     -- tries one has to fail at the TCP connect.
     local answered = nil
@@ -153,6 +183,18 @@ do
         if refused then answered = port break end
     end
     check("a closed proxy port is refused", answered == nil, "port " .. tostring(answered) .. " answered")
+end
+
+-- 7b. Replies the client must refuse rather than read past. The bound address
+--     has no fixed size: ATYP 3 puts its length in front of the address.
+do
+    local ok, response = request("127.0.0.1", ports.plain_port,
+        { proxy = proxy_url(ports.socks_bound_port) })
+    check("a bound address of variable length is read", ok and response.status == 200, response)
+    expect_error("an RFC 1929 reply with a bad version is refused", "127.0.0.1", ports.plain_port,
+        { proxy = proxy_url(ports.socks_badauth_port, "user:pass") }, "[proxy_protocol_error]")
+    expect_error("an empty bound address is refused", "127.0.0.1", ports.plain_port,
+        { proxy = proxy_url(ports.socks_emptybound_port) }, "[proxy_protocol_error]")
 end
 
 -- 8. TLS through the proxy: the certificate is still verified against the TARGET.

@@ -385,6 +385,9 @@ public static class Tb287
         public string LastRequest = "";
         public string ReportPath = "";    // written after every CONNECT so a test can assert ATYP
         public bool CloseAfterGreeting;   // accept, answer the greeting, then hang up
+        public bool BadAuthVersion;       // answer the RFC 1929 exchange with a wrong VER
+        public bool EmptyBoundAddress;    // answer ATYP 3 with a length of zero
+        public byte ReplyAddressType;   // the ATYP the success reply's BND.ADDR uses; 0 echoes the request's
         public int Requests;
         public string ForwardTo = "127.0.0.1";
         public int ForwardPort;
@@ -515,7 +518,7 @@ static bool Read(TcpClient client, byte[] wanted)
                     string gotPass = Encoding.UTF8.GetString(pass);
                     bool ok = gotUser == (User ?? "") && gotPass == (Password ?? "") && ReplyCode == 0;
                     // The RFC 1929 reply is VER | STATUS: two bytes.
-                    stream.WriteByte(0x01);
+                    stream.WriteByte(BadAuthVersion ? (byte)0x02 : (byte)0x01);
                     stream.WriteByte(ok ? (byte)0x00 : (byte)0x01);
                     stream.Flush();
                     Report((ok ? "auth-ok " : "auth-failed ") + gotUser + " plen=" + gotPass.Length);
@@ -566,10 +569,29 @@ static bool Read(TcpClient client, byte[] wanted)
                 upstream = new TcpClient();
                 upstream.Connect(ForwardTo, ForwardPort);
                 var up = upstream.GetStream();
-                WriteReply(stream, 0x00, atyp, address, targetPort);
-                var relay = new Thread(() => Pump(stream, up)) { IsBackground = true };
+                if (EmptyBoundAddress)
+                {
+                    // ATYP 3 with a length of zero: a broken proxy, not an empty
+                    // address the client may skip.
+                    byte[] broken = { 0x05, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 };
+                    stream.Write(broken, 0, broken.Length);
+                    stream.Flush();
+                    return;
+                }
+                WriteReply(stream, 0x00, ReplyAddressType != 0 ? ReplyAddressType : atyp,
+                    ReplyAddressType == 0x03 ? "bound.example" : address, targetPort);
+                // Relay both ways and tear the pair down as soon as EITHER side is
+                // done. openssl s_server serves one connection at a time and keeps
+                // it open until the peer closes: a relay that only ends when the
+                // upstream ends leaves s_server reading a connection nobody will
+                // ever close, and every later connection to that server then waits
+                // in the backlog forever. That is what made a second TLS
+                // connection through one proxy fail with an SSPI error.
+                var relay = new Thread(() => { Pump(stream, up); CloseQuietly(upstream); CloseQuietly(client); })
+                    { IsBackground = true };
                 relay.Start();
                 Pump(up, stream);
+                relay.Join(5000);
             }
             catch { }
             finally
@@ -577,6 +599,11 @@ static bool Read(TcpClient client, byte[] wanted)
                 try { if (upstream != null) upstream.Close(); } catch { }
                 try { client.Close(); } catch { }
             }
+        }
+
+        static void CloseQuietly(TcpClient client)
+        {
+            try { if (client != null) client.Close(); } catch { }
         }
 
         static void Pump(Stream from, Stream to)
@@ -630,7 +657,8 @@ function Add-Recorder {
 function Add-Socks {
     param([string]$Role, [int]$ForwardPort, [byte]$ReplyCode = 0, [bool]$NoMethods = $false,
         [bool]$CloseAfterGreeting = $false, [bool]$Silent = $false, [string]$User = '', [string]$Password = '',
-        [byte]$OnlyMethod = 0)
+        [byte]$OnlyMethod = 0, [byte]$ReplyAddressType = 0, [bool]$BadAuthVersion = $false,
+        [bool]$EmptyBoundAddress = $false)
     $socks = New-Object Tb287+Socks($Role, 0)
     $socks.ForwardPort = $ForwardPort
     $socks.ReplyCode = $ReplyCode
@@ -640,6 +668,9 @@ function Add-Socks {
     $socks.Silent = $Silent
     $socks.User = $User
     $socks.Password = $Password
+    $socks.ReplyAddressType = $ReplyAddressType
+    $socks.BadAuthVersion = $BadAuthVersion
+    $socks.EmptyBoundAddress = $EmptyBoundAddress
     $socks.ReportPath = Join-Path $workFull ($Role + '.txt')
     [void]$owned.Add($socks)
     return $socks
@@ -679,6 +710,13 @@ try {
     $socksRogue = Add-Socks -Role 'socks-rogue' -ForwardPort $roguePort
     $socksNoMethod = Add-Socks -Role 'socks-nomethod' -ForwardPort $plain.Port -NoMethods $true
     $socksClose = Add-Socks -Role 'socks-close' -ForwardPort $plain.Port -CloseAfterGreeting $true
+    # A success reply whose bound address is a NAME (ATYP 3), so the client has to
+    # read the length octet in front of it; one that answers the RFC 1929 exchange
+    # with the wrong VER; and one whose bound address is ATYP 3 with length zero.
+    $socksBound = Add-Socks -Role 'socks-bound' -ForwardPort $plain.Port -ReplyAddressType 3
+    $socksBadAuth = Add-Socks -Role 'socks-badauth' -ForwardPort $plain.Port -User 'user' -Password 'pass' `
+        -OnlyMethod 2 -BadAuthVersion $true
+    $socksEmptyBound = Add-Socks -Role 'socks-emptybound' -ForwardPort $plain.Port -EmptyBoundAddress $true
 
     $socksReplies = [ordered]@{}
     foreach ($code in 1, 2, 3, 4, 5, 6, 7, 8, 9) {
@@ -701,6 +739,9 @@ try {
         socks_rogue_port = $socksRogue.Port
         socks_nomethod_port = $socksNoMethod.Port
         socks_close_port = $socksClose.Port
+        socks_bound_port = $socksBound.Port
+        socks_badauth_port = $socksBadAuth.Port
+        socks_emptybound_port = $socksEmptyBound.Port
         socks_replies = $socksReplies
         socks_report_dir = $workFull
         ca_pem = $ca.Cert

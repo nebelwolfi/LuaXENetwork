@@ -9,7 +9,9 @@
 #include "TlsVerify.h"
 
 #include <chrono>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 // TB-287: the module's single dial path. See socket/Dial.h.
 
@@ -102,23 +104,86 @@ std::string PercentDecode(const std::string& text)
     return out;
 }
 
-void SendAll(CActiveSock& socket, const std::string& bytes, const char* what)
+// socks5 resolves the target HERE, so a name has to become an address before it
+// can go on the wire (socks5h is the other way round: the name is sent as-is).
+// IPv4 is preferred because the module's own direct connect is an AF_INET socket;
+// IPv6 is the fallback, so an IPv6-only target still works. The bytes come back
+// ready to append: 4 for ATYP 1, 16 for ATYP 4.
+bool ResolveLocally(const std::wstring& host, std::vector<unsigned char>& address)
 {
-    const int sent = socket.Send(bytes.data(), bytes.size());
+    address.clear();
+    ADDRINFOW hintsW{};
+    hintsW.ai_family = AF_UNSPEC;
+    hintsW.ai_socktype = SOCK_STREAM;
+    hintsW.ai_protocol = IPPROTO_TCP;
+    PADDRINFOW results = nullptr;
+    // The W variant explicitly: this translation unit is an ANSI build, so the
+    // unqualified name is the one that takes char*, and the host is a wstring.
+    if (GetAddrInfoW(host.c_str(), nullptr, &hintsW, &results) != 0 || results == nullptr)
+        return false;
+    for (const int family : { AF_INET, AF_INET6 }) {
+        for (const ADDRINFOW* entry = results; entry != nullptr; entry = entry->ai_next) {
+            if (entry->ai_family != family || entry->ai_addr == nullptr) continue;
+            const size_t wanted = family == AF_INET ? 4u : 16u;
+            if (entry->ai_addrlen < wanted) continue;
+            const unsigned char* first = reinterpret_cast<const unsigned char*>(entry->ai_addr) +
+                (family == AF_INET
+                    ? offsetof(sockaddr_in, sin_addr)
+                    : offsetof(sockaddr_in6, sin6_addr));
+            address.assign(first, first + wanted);
+            FreeAddrInfoW(results);
+            return true;
+        }
+    }
+    FreeAddrInfoW(results);
+    return false;
+}
+
+// Every step of the exchange is armed from the caller's deadline instead of from
+// the one timeout that was set before the TCP connect: CBaseSock restarts its
+// recv timer on every read, so without this a caller that set total_timeout_ms
+// (the only overall budget there is) could still be held for a fresh
+// connect_timeout per step - or, with a proxy that answers a byte at a time,
+// for as long as it likes.
+struct StepBudget {
+    CActiveSock& socket;
+    const DialOptions& options;
+    const std::chrono::steady_clock::time_point started;
+
+    // Remaining() throws [timeout] once the budget is spent, so an expired
+    // deadline is a failure instead of one more read. The socket's own timers
+    // count whole seconds (CBaseSock keeps a seconds count), which is why
+    // Seconds() rounds up: the deadline holds to within a second.
+    void Arm() const
+    {
+        const int milliseconds = Remaining(options, started);
+        socket.SetSendTimeoutSeconds(Seconds(milliseconds));
+        socket.SetRecvTimeoutSeconds(Seconds(milliseconds));
+    }
+};
+
+void SendAll(const StepBudget& budget, const std::string& bytes, const char* what)
+{
+    budget.Arm();
+    const int sent = budget.socket.Send(bytes.data(), bytes.size());
     if (sent != static_cast<int>(bytes.size()))
         throw DialError("proxy_protocol_error",
             std::string("[proxy_protocol_error] could not send the ") + what + " to the SOCKS5 proxy ("
             + std::to_string(sent) + " of " + std::to_string(bytes.size()) + " bytes, error "
-            + std::to_string(socket.GetLastError()) + ")");
+            + std::to_string(budget.socket.GetLastError()) + ")");
 }
 
-// Exactly `count` bytes, or a failure that says which one it was.
-std::string RecvExact(CActiveSock& socket, size_t count, const char* what)
+// Exactly `count` bytes, or a failure that says which one it was. A short read is
+// never taken as good enough: CBaseSock::Recv already loops until MinLen, so
+// anything less than count means the connection ended or stopped making progress.
+std::string RecvExact(const StepBudget& budget, size_t count, const char* what)
 {
+    if (count == 0) return {};
+    budget.Arm();
     std::string buffer(count, '\0');
-    const int received = socket.Recv(buffer.data(), count, count);
+    const int received = budget.socket.Recv(buffer.data(), count, count);
     if (received == SOCKET_ERROR) {
-        const DWORD error = socket.GetLastError();
+        const DWORD error = budget.socket.GetLastError();
         if (error == ERROR_TIMEOUT || error == WSAETIMEDOUT)
             throw DialError("proxy_timeout", std::string("[proxy_timeout] the SOCKS5 proxy did not send the ")
                 + what + " in time");
@@ -128,7 +193,7 @@ std::string RecvExact(CActiveSock& socket, size_t count, const char* what)
     if (static_cast<size_t>(received) != count)
         throw DialError("proxy_closed", std::string("[proxy_closed] the SOCKS5 proxy closed the connection during the ")
             + what + " (" + std::to_string(received) + " of " + std::to_string(count)
-            + " bytes, error " + std::to_string(socket.GetLastError()) + ")");
+            + " bytes, error " + std::to_string(budget.socket.GetLastError()) + ")");
     return buffer;
 }
 
@@ -172,25 +237,29 @@ std::string ConnectRequest(const ProxyTarget& target, const std::wstring& host, 
     request += static_cast<char>(0x00);   // reserved
     if (target.remote_dns) {
         const std::string name = Utf8(host);
+        // RFC 1928: ATYP 3 carries the length in ONE octet, so 1-255 bytes.
         if (name.empty() || name.size() > 255)
-            throw DialError("proxy_url_invalid", "proxy_url_invalid: the target host name is not 1-255 bytes");
+            throw DialError("proxy_target_name_invalid",
+                "[proxy_target_name_invalid] the target host name must be 1-255 bytes for socks5h, this one is "
+                + std::to_string(name.size()));
         request += static_cast<char>(0x03);   // domain name
         request += static_cast<char>(name.size());
         request += name;
     } else {
-        // socks5: the address goes on the wire in binary, not as text.
-        char buffer[16] = { 0 };
+        // socks5: the address goes on the wire in binary, not as text - which
+        // means the name has to be resolved HERE first.
         IN_ADDR v4{};
         if (InetPtonW(AF_INET, host.c_str(), &v4)) {
             request += static_cast<char>(0x01);
             request.append(reinterpret_cast<const char*>(&v4), 4);
         } else {
-            IN6_ADDR v6{};
-            if (!InetPtonW(AF_INET6, host.c_str(), &v6))
+            std::vector<unsigned char> resolved;
+            if (!ResolveLocally(host, resolved))
                 throw DialError("proxy_dns_failed",
-                    "[proxy_dns_failed] could not resolve " + Endpoint(host, port));
-            request += static_cast<char>(0x04);
-            request.append(reinterpret_cast<const char*>(&v6), 16);
+                    "[proxy_dns_failed] could not resolve " + Endpoint(host, port)
+                    + " locally for a socks5 proxy request; socks5h:// lets the proxy resolve it instead");
+            request += resolved.size() == 4 ? static_cast<char>(0x01) : static_cast<char>(0x04);
+            request.append(reinterpret_cast<const char*>(resolved.data()), resolved.size());
         }
     }
     request += static_cast<char>((port >> 8) & 0xFF);
@@ -198,10 +267,11 @@ std::string ConnectRequest(const ProxyTarget& target, const std::wstring& host, 
     return request;
 }
 
-void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::wstring& host,
-    unsigned short port)
+void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const DialOptions& options,
+    std::chrono::steady_clock::time_point started, const std::wstring& host, unsigned short port)
 {
     const std::string where = "the SOCKS5 proxy at " + Utf8(target.host) + ":" + std::to_string(target.port);
+    const StepBudget budget{ socket, options, started };
 
     // 1. method negotiation
     std::string greeting;
@@ -214,8 +284,8 @@ void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::
         greeting += static_cast<char>(0x01);
         greeting += static_cast<char>(0x00);
     }
-    SendAll(socket, greeting, "method list");
-    const std::string choice = RecvExact(socket, 2, "method reply");
+    SendAll(budget, greeting, "method list");
+    const std::string choice = RecvExact(budget, 2, "method reply");
     if (static_cast<unsigned char>(choice[0]) != 0x05)
         throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " is not SOCKS5");
     if (static_cast<unsigned char>(choice[1]) == 0xFF)
@@ -230,14 +300,19 @@ void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::
         if (!target.has_credentials)
             throw DialError("proxy_no_acceptable_auth",
                 "[proxy_no_acceptable_auth] " + where + " requires a username and password, and none were given");
+        // RFC 1929: ULEN and PLEN are one octet each, which ParseProxyUrl has
+        // already bounded to 1-255 bytes - the cast cannot truncate.
         std::string authentication;
         authentication += static_cast<char>(0x01);
         authentication += static_cast<char>(target.user.size());
         authentication += target.user;
         authentication += static_cast<char>(target.password.size());
         authentication += target.password;
-        SendAll(socket, authentication, "credentials");
-        const std::string verdict = RecvExact(socket, 2, "authentication reply");
+        SendAll(budget, authentication, "credentials");
+        const std::string verdict = RecvExact(budget, 2, "authentication reply");
+        if (static_cast<unsigned char>(verdict[0]) != 0x01)
+            throw DialError("proxy_protocol_error",
+                "[proxy_protocol_error] " + where + " answered the RFC 1929 authentication with a bad version");
         if (static_cast<unsigned char>(verdict[1]) != 0x00)
             // Deliberately says nothing about the values: credentials never
             // appear in an error message.
@@ -246,8 +321,8 @@ void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::
     }
 
     // 3. CONNECT and the whole reply, including the bound address
-    SendAll(socket, ConnectRequest(target, host, port), "CONNECT request");
-    const std::string header = RecvExact(socket, 4, "CONNECT reply");
+    SendAll(budget, ConnectRequest(target, host, port), "CONNECT request");
+    const std::string header = RecvExact(budget, 4, "CONNECT reply");
     if (static_cast<unsigned char>(header[0]) != 0x05)
         throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " answered a CONNECT with a bad version");
     const unsigned char code = static_cast<unsigned char>(header[1]);
@@ -258,15 +333,20 @@ void Socks5Handshake(CActiveSock& socket, const ProxyTarget& target, const std::
     case 0x01: address_length = 4; break;
     case 0x04: address_length = 16; break;
     case 0x03: {
-        const std::string length = RecvExact(socket, 1, "CONNECT reply");
+        // ATYP 3: the length itself is one more octet, and it is read before the
+        // address - a fixed-size read here would swallow part of the name.
+        const std::string length = RecvExact(budget, 1, "CONNECT reply");
         address_length = static_cast<unsigned char>(length[0]);
+        if (address_length == 0)
+            throw DialError("proxy_protocol_error",
+                "[proxy_protocol_error] " + where + " answered a CONNECT with an empty bound address");
         break;
     }
     default:
         throw DialError("proxy_protocol_error", "[proxy_protocol_error] " + where + " answered with an unknown address type");
     }
-    RecvExact(socket, address_length, "CONNECT reply");   // the bound address
-    RecvExact(socket, 2, "CONNECT reply");                // the bound port
+    RecvExact(budget, address_length, "CONNECT reply");   // the bound address
+    RecvExact(budget, 2, "CONNECT reply");                // the bound port
 }
 
 } // namespace
@@ -371,7 +451,7 @@ DialedConnection Dial(const DialOptions& options, HANDLE shutdown_event)
             const DWORD code = socket->GetLastError();
             throw DialError("proxy_connect_refused", DialErrorText(proxy.host, proxy.port, code));
         }
-        Socks5Handshake(*socket, proxy, options.host, options.port);
+        Socks5Handshake(*socket, proxy, options, started, options.host, options.port);
     } else if (!socket->Connect(options.host.c_str(), options.port)) {
         const DWORD code = socket->GetLastError();
         throw DialError("connect_failed", DialErrorText(options.host, options.port, code));

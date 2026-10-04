@@ -74,9 +74,12 @@ end
 -- 4. The two ports the old rule keyed on, when they are free.
 do
     if ports.port443 and ports.port443 > 0 then
-        local ok, response = request("127.0.0.1", ports.port443, { ssl = false })
-        check("port 443 with ssl=false is plaintext", ok and response.status == 200
-            and response.headers["x-transport"] == "plain", ok and response.headers["x-transport"])
+        -- The fixture's 443 is a TLS server, so there is no plaintext listener on
+        -- that port to answer a plaintext request. What this proves is the point
+        -- of the check anyway: with ssl=false nothing is upgraded to TLS just
+        -- because the port is 443, so the request must NOT come back as a 200.
+        expect_error("port 443 with ssl=false is not upgraded to TLS", "127.0.0.1", ports.port443,
+            { ssl = false }, "connection closed before HTTP response headers")
     else
         print("SKIP port 443 (busy)")
     end

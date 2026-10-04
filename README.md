@@ -80,12 +80,17 @@ RFC 1929 username/password when the proxy asks for it, and a CONNECT - then TLS
 (if `ssl`) with SNI and verification for the **target**, then HTTP exactly as
 before.
 
-* `socks5` resolves the target here and sends an address (ATYP 1/4).
-* `socks5h` sends the target's name (ATYP 3) and lets the proxy resolve it.
+* `socks5` resolves the target here (IPv4 preferred, IPv6 as the fallback, like
+  the module's own direct connect) and sends an address (ATYP 1/4).
+* `socks5h` sends the target's name (ATYP 3, so at most 255 bytes) and lets the
+  proxy resolve it.
 * Credentials are percent-decoded (`pa%73s` is `pass`) and **never** appear in an
   error message.
 * A malformed or unknown scheme is an error. There is **no fallback to a direct
   connection**: if the proxy cannot be used, the request fails.
+* The handshake is bounded by the caller's deadline: `connect_timeout_ms` covers
+  each step, and `total_timeout_ms`, when set, is one budget for the connect, the
+  whole SOCKS5 conversation and the TLS handshake together.
 
 | code | meaning |
 |---|---|
@@ -107,6 +112,7 @@ before.
 | `proxy_address_type_unsupported` | reply 08 |
 | `proxy_reply_unknown` | any other reply code |
 | `proxy_dns_failed` | socks5 could not resolve the target name locally |
+| `proxy_target_name_invalid` | socks5h cannot carry that target name (not 1-255 bytes) |
 
 Without a proxy, connection failures are `connect_refused`, `connect_timeout`,
 `connect_network_unreachable`, `dns_failed` or `connect_failed`.
