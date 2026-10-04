@@ -115,6 +115,38 @@ DWORD CSSLClient::GetLastError() const
 		return m_SocketStream->GetLastError();
 }
 
+// The SDK header this module builds against does not declare the extended-error
+// context, so it is spelled out here: the layout is the documented one
+// (SecPkgContext_ExtendedError) and the attribute id is 0x82.
+struct ExtendedErrorHeader {
+    DWORD dwVersion;
+    DWORD dwOpcode;
+    DWORD cbString;
+    DWORD dwFlags;
+    unsigned long ulErrorId;
+};
+constexpr DWORD kSecPkgAttrExtendedError = 0x82;
+constexpr DWORD kSecPkgExtendedErrorVersion = 1;
+
+// TB-287: SECPKG_ATTR_EXTENDED_ERROR is only readable while the context is still
+// open, so it is captured before the failure path closes it. Without it a failed
+// handshake reports SEC_E_INTERNAL_ERROR and nothing else.
+void CSSLClient::CaptureExtendedError()
+{
+	m_LastExtendedError.clear();
+	if (!m_hContext) return;
+	ExtendedErrorHeader header{};
+    if (FAILED(g_pSSPI->QueryContextAttributesW(m_hContext.getunsaferef(),
+		kSecPkgAttrExtendedError, &header))) return;
+	if (header.dwVersion != kSecPkgExtendedErrorVersion) return;
+	if (header.cbString == 0 || header.cbString > 8192) return;
+	std::vector<wchar_t> text(header.cbString);
+	header.cbString = static_cast<DWORD>(text.size());
+	if (SUCCEEDED(g_pSSPI->QueryContextAttributesW(m_hContext.getunsaferef(),
+		kSecPkgAttrExtendedError, &header)) && text[0] != 0)
+		m_LastExtendedError = text.data();
+}
+
 int CSSLClient::Recv(LPVOID lpBuf, const size_t Len, const size_t MinLen)
 {
 	UNREFERENCED_PARAMETER(MinLen);
@@ -499,7 +531,9 @@ SECURITY_STATUS CSSLClient::SSPINegotiateLoop(LPCWCHAR ServerName)
 
 	if (scRet != SEC_I_CONTINUE_NEEDED)
 	{
+		CaptureExtendedError();
 		DebugMsg("**** Error %#x returned by InitializeSecurityContext (1)", scRet);
+		m_LastSecurityStatus = scRet;
 		return scRet;
 	}
 
@@ -760,6 +794,7 @@ SECURITY_STATUS CSSLClient::SSPINegotiateLoop(LPCWCHAR ServerName)
 
 		if (FAILED(scRet))
 		{
+			CaptureExtendedError();
 			DebugMsg("**** Error %#x returned by InitializeSecurityContext (2)", scRet);
 			break;
 		}
@@ -836,6 +871,7 @@ SECURITY_STATUS CSSLClient::SSPINegotiateLoop(LPCWCHAR ServerName)
 	else
 		m_encrypting = true;
 
+	m_LastSecurityStatus = scRet;
 	return scRet;
 }
 

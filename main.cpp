@@ -8,6 +8,7 @@
 #include "socket/SSLClient.h"
 #include "socket/EventWrapper.h"
 #include "socket/CertHelper.h"
+#include "socket/Dial.h"
 #include <iomanip>
 #include <fstream>
 #include "misc/misc.h"
@@ -134,176 +135,9 @@ std::string ResponseBuilder(lua_State *L, int idx = 1) {
     return request;
 }
 
-bool WorkOnBody(std::string& Body, std::string& ChunkedBody, int& CurrentChunkSize) {
-    //printf("workonbody\n");
-    if (CurrentChunkSize == 0) { // no chunksize yet, check for one
-        auto EndOfLine = Body.find_first_of("\r\n");
-        if (EndOfLine == std::string::npos) { // failed to get a chunksize, that should not really be possible
-            //printf("failed to get a chunksize\n");
-            return false;
-        }
-        //printf("Body: %s", Body.c_str());
-
-        auto ChunkSize = Body.substr(0, EndOfLine);
-        Body = Body.substr(EndOfLine + 2);
-        CurrentChunkSize = std::stol(ChunkSize, nullptr, 16);
-        if (CurrentChunkSize == 0) { // return since i got the last chunk
-            //printf("got last chunk");
-            CurrentChunkSize = -1;
-            return false;
-        } else {
-            return true;
-        }
-    }
-
-    if (Body.size() >= CurrentChunkSize + 2) { // body size is big enouth for chunkedbody
-        ChunkedBody += Body.substr(0, CurrentChunkSize);
-        //printf("ChunkedBody: %s", ChunkedBody.c_str());
-
-        Body = Body.substr(CurrentChunkSize + 2);
-        CurrentChunkSize = 0;
-        return true;
-    }
-
-    return false;
-}
-
-std::string ResolveWebRequest(lua_State* L, const std::string& HostA, const std::wstring& HostW, int Port, const std::string& RequestString, bool force_ssl) {
-    CEventWrapper ShutDownEvent;
-    auto pActiveSock = std::make_unique<CActiveSock>(ShutDownEvent);
-    pActiveSock->SetRecvTimeoutSeconds(30);
-    pActiveSock->SetSendTimeoutSeconds(60);
-
-    bool b = pActiveSock->Connect(HostW.c_str(), static_cast<USHORT>(Port));
-    if (!b) {
-        luaL_error(L, "Could not connect to the Server");
-        return "";
-    }
-    std::unique_ptr<CSSLClient> pSSLClient;
-    if (Port == 443 || force_ssl)
-    {
-        pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
-        pSSLClient->ServerCertAcceptable = CertAcceptable;
-        pSSLClient->SelectClientCertificate = SelectClientCertificate;
-        HRESULT hr = pSSLClient->Initialize(HostW.c_str());
-        if (SUCCEEDED(hr)) {
-            pSSLClient->Send(RequestString.c_str(), RequestString.size());
-        } else {
-            pActiveSock->Send(RequestString.c_str(), RequestString.size());
-        }
-    } else {
-        pActiveSock->Send(RequestString.c_str(), RequestString.size());
-    }
-
-    int BufferBytesReceiving = 4096;
-    int ContentLength = 0;
-    bool GotHeaders = false;
-    bool RequestFinished = false;
-    bool IsChunked = false;
-    bool AlreadyAddedNewMsg = false;
-    int CurrentChunkSize = 0;
-    std::string CompleteReceive = "";
-    std::string Header = "";
-    std::string Body = "";
-    std::string ChunkedBody = "";
-
-    try {
-    while (!RequestFinished) {
-        std::string ReceiveMsgBuffer;
-        ReceiveMsgBuffer.resize(BufferBytesReceiving);
-        ReceiveMsgBuffer.reserve(BufferBytesReceiving);
-        int BytesReceived = 0;
-        int res = 0;
-
-        if (pSSLClient) {
-            res = (BytesReceived = pSSLClient->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
-        } else {
-            res = (BytesReceived = pActiveSock->Recv(&ReceiveMsgBuffer[0], BufferBytesReceiving));
-        }
-        if (0 < res) {
-            std::string ReceiveMsg = ReceiveMsgBuffer.substr(0, BytesReceived);
-            CompleteReceive += ReceiveMsg;
-            //printf("ReceivedMsg");
-            if (!GotHeaders && CompleteReceive.find("\r\n\r\n") != std::string::npos) {
-                Header = CompleteReceive.substr(0, CompleteReceive.find("\r\n\r\n"));
-                Body = CompleteReceive.substr(CompleteReceive.find("\r\n\r\n") + 4);
-                GotHeaders = true;
-
-                if (Header.find("ncoding: chunked") != std::string::npos) {
-                    IsChunked = true;
-                }
-                AlreadyAddedNewMsg = true;
-
-                //printf("Header: %s", Header.c_str());
-            }
-            if (GotHeaders) {
-                if (!AlreadyAddedNewMsg) {
-                    CompleteReceive += ReceiveMsg;
-                    Body += ReceiveMsg;
-                }
-                if (IsChunked) {
-                    while (WorkOnBody(Body, ChunkedBody, CurrentChunkSize)) {
-                        //lop
-                    }
-
-                    if (CurrentChunkSize == -1) {
-                        RequestFinished = true;
-                        Body = ChunkedBody;
-                    }
-                } else {
-                    int ContentLengthStart = Header.find("Content-Length:");
-                    if (ContentLengthStart == std::string::npos) {
-                        ContentLengthStart = Header.find("Content-length:");
-                        if (ContentLengthStart == std::string::npos) {
-                            ContentLengthStart = Header.find("content-length:");
-                            if (ContentLengthStart == std::string::npos) {
-                                ContentLengthStart = Header.find("content-Length:");
-                            }
-                        }
-                    }
-                    if (ContentLengthStart == std::string::npos) {
-                        if (Body.ends_with("0\r\n\r\n")) {
-                            RequestFinished = true;
-                        }
-                    } else {
-                        int ContentLengthEnd = Header.find("\r\n", ContentLengthStart + 16);
-                        ContentLength = std::stoi(Header.substr(ContentLengthStart + 16, ContentLengthEnd - ContentLengthStart - 16));
-                        if (Body.size() >= ContentLength) {
-                            RequestFinished = true;
-                        }
-                    }
-                }
-            }
-            AlreadyAddedNewMsg = false;
-            ReceiveMsg.clear();
-        }
-        else if (res == 0)
-        {
-            //luaL_error(L, "Connection closed by server");
-            //printf("Connection closed by server\n");
-            RequestFinished = true;
-        }
-        else
-        {
-            luaL_error(L, "Error receiving data: %d", WSAGetLastError());
-            RequestFinished = true;
-        }
-    }
-    } catch (std::exception& e) {
-        luaL_error(L, "Error receiving data: %s", e.what());
-    }
-    if (Body.size() < ContentLength) {
-        luaL_error(L, "Content-Length mismatch! %d vs %d", Body.size(), ContentLength);
-        return "";
-    }
-    if (Body.empty()) {
-        //luaL_error(L, "No Body received");
-        return "";
-    }
-    //printf("%s\n", Header.c_str());
-    //printf("Body length: %d\n", Body.size());
-    return Body;
-}
+// TB-287: the unreferenced ResolveWebRequest() and its WorkOnBody() chunk helper
+// are gone. They were the last place that picked TLS from `Port == 443`, and
+// nothing called them; every request now goes through socket/Dial.h.
 
 struct HttpRequestOptions {
     int connect_timeout_ms = 30000;
@@ -314,6 +148,17 @@ struct HttpRequestOptions {
     size_t buffer_size = 16384;
     int request_index = 0;
     bool return_response = false;
+    // TLS is decided by ssl, on any port. When the caller says nothing, port 443
+    // keeps meaning TLS so an existing caller cannot start sending an API key in
+    // clear; `ssl = false` on port 443 really does stay plaintext.
+    std::optional<bool> ssl;
+    std::wstring sni;                 // empty: host is the name to verify and the SNI
+    std::string ca_file;              // empty: the Windows root store
+    bool tls_verify = true;
+    bool tls_check_revocation = true;
+    std::optional<ProxyTarget> proxy;
+
+    bool UseSsl(int port) const { return ssl.value_or(port == 443); }
 };
 
 struct HttpResponse {
@@ -343,6 +188,24 @@ static bool RequestBoolean(lua_State* L, int index, const char* name, bool fallb
     return value;
 }
 
+// nil (absent) stays absent: "ssl" and "proxy" have to tell "not given" from "no".
+static std::optional<bool> RequestOptionalBoolean(lua_State* L, int index, const char* name) {
+    if (!index || !lua_istable(L, index)) return std::nullopt;
+    lua_getfield(L, index, name);
+    const std::optional<bool> value = lua_isboolean(L, -1)
+        ? std::optional<bool>(lua_toboolean(L, -1) != 0) : std::nullopt;
+    lua_pop(L, 1);
+    return value;
+}
+
+static std::string RequestString(lua_State* L, int index, const char* name) {
+    if (!index || !lua_istable(L, index)) return {};
+    lua_getfield(L, index, name);
+    const std::string value = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    lua_pop(L, 1);
+    return value;
+}
+
 static HttpRequestOptions ReadRequestOptions(lua_State* L, int index) {
     HttpRequestOptions options;
     if (!index || !lua_istable(L, index)) return options;
@@ -358,6 +221,12 @@ static HttpRequestOptions ReadRequestOptions(lua_State* L, int index) {
     options.buffer_size = static_cast<size_t>(std::clamp<long long>(
         RequestInteger(L, index, "buffer_size", static_cast<long long>(options.buffer_size)), 1024, 1024 * 1024));
     options.return_response = RequestBoolean(L, index, "return_response", false);
+    options.ssl = RequestOptionalBoolean(L, index, "ssl");
+    options.ca_file = RequestString(L, index, "ca_file");
+    options.tls_verify = RequestBoolean(L, index, "tls_verify", true);
+    options.tls_check_revocation = RequestBoolean(L, index, "tls_revoke", true);
+    const std::string sni = RequestString(L, index, "sni");
+    if (!sni.empty()) options.sni = utf8_decode_lua(sni);
     options.connect_timeout_ms = std::max(1000, options.connect_timeout_ms);
     options.send_timeout_ms = std::max(1000, options.send_timeout_ms);
     options.receive_timeout_ms = std::max(1000, options.receive_timeout_ms);
@@ -552,7 +421,7 @@ static std::string SocketErrorMessage(const char* operation, DWORD code, int tim
 }
 
 static HttpResponse ResolveHttpRequest(lua_State* L, const std::wstring& host, int port,
-    const std::string& request, bool use_ssl, const HttpRequestOptions& options) {
+    const std::string& request, const HttpRequestOptions& options) {
     const auto started = std::chrono::steady_clock::now();
     const auto bounded_timeout = [&](int configured) {
         if (options.total_timeout_ms <= 0) return configured;
@@ -565,29 +434,28 @@ static HttpResponse ResolveHttpRequest(lua_State* L, const std::wstring& host, i
         return static_cast<int>(std::min<long long>(configured, remaining));
     };
     CEventWrapper shutdown_event;
-    auto socket = std::make_unique<CActiveSock>(shutdown_event);
-    socket->SetRecvTimeoutSeconds(TimeoutSeconds(options.receive_timeout_ms));
-    const int connect_timeout = bounded_timeout(options.connect_timeout_ms);
-    socket->SetSendTimeoutSeconds(TimeoutSeconds(connect_timeout));
-    if (!socket->Connect(host.c_str(), static_cast<USHORT>(port)))
-        throw std::runtime_error(SocketErrorMessage("connect", socket->GetLastError(), connect_timeout));
-
-    std::unique_ptr<CSSLClient> ssl;
-    if (use_ssl) {
-        ssl = std::make_unique<CSSLClient>(socket.get());
-        ssl->ServerCertAcceptable = CertAcceptable;
-        ssl->SelectClientCertificate = SelectClientCertificate;
-        const HRESULT result = ssl->Initialize(host.c_str());
-        if (FAILED(result))
-            throw std::runtime_error("TLS handshake failed (error "
-                + std::to_string(static_cast<unsigned long>(result)) + ")");
-    }
+    // TB-287: TLS comes from the ssl option, not from the port, and the proxy (if
+    // any) is part of the same dial.
+    DialOptions dial;
+    dial.host = host;
+    dial.port = static_cast<unsigned short>(port);
+    dial.ssl = options.UseSsl(port);
+    dial.sni = options.sni;
+    dial.proxy = options.proxy;
+    dial.ca_file = options.ca_file;
+    dial.tls_verify = options.tls_verify;
+    dial.tls_check_revocation = options.tls_check_revocation;
+    dial.connect_timeout_ms = options.connect_timeout_ms;
+    dial.total_timeout_ms = options.total_timeout_ms;
+    DialedConnection connection = Dial(dial, shutdown_event.Event());
+    CActiveSock& socket = *connection.socket;
+    CSSLClient* const ssl = connection.tls.get();
 
     const int send_timeout = bounded_timeout(options.send_timeout_ms);
-    socket->SetSendTimeoutSeconds(TimeoutSeconds(send_timeout));
-    const int sent = ssl ? ssl->Send(request.data(), request.size()) : socket->Send(request.data(), request.size());
+    socket.SetSendTimeoutSeconds(TimeoutSeconds(send_timeout));
+    const int sent = ssl ? ssl->Send(request.data(), request.size()) : socket.Send(request.data(), request.size());
     if (sent == SOCKET_ERROR || static_cast<size_t>(sent) != request.size()) {
-        const DWORD code = ssl ? ssl->GetLastError() : socket->GetLastError();
+        const DWORD code = ssl ? ssl->GetLastError() : socket.GetLastError();
         throw std::runtime_error(SocketErrorMessage("send", code, send_timeout));
     }
 
@@ -611,13 +479,13 @@ static HttpResponse ResolveHttpRequest(lua_State* L, const std::wstring& host, i
     while (!finished) {
         if (RequestCancelled(L, options.request_index)) throw std::runtime_error("request cancelled");
         const int receive_timeout = bounded_timeout(options.receive_timeout_ms);
-        socket->SetRecvTimeoutSeconds(TimeoutSeconds(receive_timeout));
+        socket.SetRecvTimeoutSeconds(TimeoutSeconds(receive_timeout));
 
         std::string receive_buffer(options.buffer_size, '\0');
         const int received = ssl ? ssl->Recv(receive_buffer.data(), receive_buffer.size())
-                                 : socket->Recv(receive_buffer.data(), receive_buffer.size());
+                                 : socket.Recv(receive_buffer.data(), receive_buffer.size());
         if (received == SOCKET_ERROR) {
-            const DWORD code = ssl ? ssl->GetLastError() : socket->GetLastError();
+            const DWORD code = ssl ? ssl->GetLastError() : socket.GetLastError();
             if (ssl && code == SEC_I_CONTEXT_EXPIRED) { finished = true; break; }
             throw std::runtime_error(SocketErrorMessage("receive", code, receive_timeout));
         }
@@ -674,7 +542,6 @@ static int WebRequestImpl(lua_State* L, bool force_response_table) {
     std::string HostA;
     std::wstring HostW;
     int Port = 443;
-    bool force_ssl = false;
     int request_index = 0;
     if (lua_isstring(L, 1) && lua_gettop(L) > 1) {
         HostA = lua_tostring(L, 1);
@@ -682,6 +549,9 @@ static int WebRequestImpl(lua_State* L, bool force_response_table) {
         if (lua_isnumber(L, 2)) {
             Port = lua_tointeger(L, 2);
         } else if (lua_istable(L, 2)) {
+            // network.request("host", {port = …, ssl = …, headers = …}): the
+            // option table is the request table, so it also carries the options.
+            request_index = 2;
             lua_getfield(L, 2, "port");
             if (lua_isnumber(L, -1)) {
                 Port = lua_tointeger(L, -1);
@@ -705,10 +575,6 @@ static int WebRequestImpl(lua_State* L, bool force_response_table) {
             Port = lua_tointeger(L, -1);
         }
         lua_pop(L, 1);
-        if (luaL_getfield(L, 1, "ssl") == LUA_TBOOLEAN) {
-            force_ssl = lua_toboolean(L, -1);
-        }
-        lua_pop(L, 1);
     } else {
         luaL_error(L, "missing 'host' parameter");
         return 0;
@@ -719,8 +585,7 @@ static int WebRequestImpl(lua_State* L, bool force_response_table) {
     HttpRequestOptions options = ReadRequestOptions(L, request_index);
     if (force_response_table) options.return_response = true;
     try {
-        const HttpResponse response = ResolveHttpRequest(L, HostW, Port, RequestString,
-            force_ssl || Port == 443, options);
+        const HttpResponse response = ResolveHttpRequest(L, HostW, Port, RequestString, options);
         if (options.return_response) PushResponse(L, response, true);
         else lua_pushlstring(L, response.body.data(), response.body.size());
         return 1;
@@ -785,11 +650,14 @@ static int WebRequest_SimpleGET(lua_State *L) {
         const ParsedHttpUrl target = ParseHttpUrl(luaL_checkstring(L, 1));
         const int options_index = lua_istable(L, 2) ? 2 : 0;
         HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        // The scheme decides unless the caller said otherwise: `ssl` wins, so
+        // network.get("http://x/", {ssl = true}) really is TLS.
+        if (!options.ssl) options.ssl = target.ssl;
         const std::string request = "GET " + target.path
             + " HTTP/1.1\r\nAccept: text/html\r\nAccept-Encoding: identity\r\nConnection: close\r\nHost: "
             + HttpHostHeader(target) + "\r\n\r\n";
         const HttpResponse response = ResolveHttpRequest(L, utf8_decode_lua(target.host), target.port,
-            request, target.ssl, options);
+            request, options);
         if (options.return_response) PushResponse(L, response, true);
         else lua_pushlstring(L, response.body.data(), response.body.size());
         return 1;
@@ -804,11 +672,13 @@ static int WebRequest_SimpleDownload(lua_State *L) {
         const std::filesystem::path local_path = luaL_checkstring(L, 2);
         const int options_index = lua_istable(L, 3) ? 3 : 0;
         HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        // The scheme decides unless the caller said otherwise (see get above).
+        if (!options.ssl) options.ssl = target.ssl;
         const std::string request = "GET " + target.path
             + " HTTP/1.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\nHost: "
             + HttpHostHeader(target) + "\r\n\r\n";
         const HttpResponse response = ResolveHttpRequest(L, utf8_decode_lua(target.host), target.port,
-            request, target.ssl, options);
+            request, options);
         std::error_code ec;
         if (!local_path.parent_path().empty() && !std::filesystem::exists(local_path.parent_path(), ec))
             std::filesystem::create_directories(local_path.parent_path(), ec);
@@ -1060,13 +930,18 @@ public:
         std::wstring HostW;
         int Port = 443;
         bool block = true;
+        int options_index = 0;
         if (lua_isstring(L, 1) && lua_gettop(L) > 1) {
             HostA = lua_tostring(L, 1);
-            HostW = std::wstring(HostA.begin(), HostA.end());
+            // Decoded like every other entry point: the host is now the SNI and
+            // the name the certificate is verified against, and reinterpreting
+            // UTF-8 bytes as UTF-16 units would send a garbage name.
+            HostW = utf8_decode_lua(HostA);
             if (lua_isnumber(L, 2)) {
                 Port = lua_tointeger(L, 2);
                 block = lua_toboolean(L, 3);
             } else if (lua_istable(L, 2)) {
+                options_index = 2;
                 lua_getfield(L, 2, "port");
                 if (lua_isnumber(L, -1)) {
                     Port = lua_tointeger(L, -1);
@@ -1080,6 +955,7 @@ public:
                 block = lua_toboolean(L, 2);
             }
         } else if (lua_istable(L, 1)) {
+            options_index = 1;
             if (luaL_getfield(L, 1, "host") == LUA_TSTRING) {
                 HostA = lua_tostring(L, -1);
                 HostW = utf8_decode_lua(HostA);
@@ -1102,7 +978,39 @@ public:
             return;
         }
 
-        pActiveSock = std::make_unique<CActiveSock>(ShutDownEvent);
+        // TB-287: the same options, the same dial path and the same certificate
+        // verification as an HTTP request. TLS comes from `ssl`, not from 443.
+        HttpRequestOptions options = ReadRequestOptions(L, options_index);
+        DialOptions dial;
+        dial.host = HostW;
+        dial.port = static_cast<unsigned short>(Port);
+        dial.ssl = options.UseSsl(Port);
+        dial.sni = options.sni;
+        dial.proxy = options.proxy;
+        dial.ca_file = options.ca_file;
+        dial.tls_verify = options.tls_verify;
+        dial.tls_check_revocation = options.tls_check_revocation;
+        dial.connect_timeout_ms = options.connect_timeout_ms;
+        dial.total_timeout_ms = options.total_timeout_ms;
+
+        // Every failure is caught before the members below are owned, so the
+        // luaL_error longjmp cannot leak the socket or the event handle. The
+        // message is copied into a plain buffer first: a longjmp skips the
+        // destructors of every local, so a std::string here would leak.
+        DialedConnection connection;
+        char failure[512] = { 0 };
+        try {
+            connection = Dial(dial, ShutDownEvent.Event());
+        } catch (const DialError& error) {
+            strncpy_s(failure, error.what(), _TRUNCATE);
+        }
+        if (failure[0] != 0) {
+            ShutDownEvent.Close();
+            luaL_error(L, "%s", failure);
+            return;
+        }
+        pActiveSock = std::move(connection.socket);
+        pSSLClient = std::move(connection.tls);
 
         if (!block) {
             u_long arg = 1;
@@ -1110,21 +1018,6 @@ public:
 
             int rc = 1;
             setsockopt(pActiveSock->ActualSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&rc, sizeof(int));
-        }
-
-        bool b = pActiveSock->Connect(HostW.c_str(), static_cast<USHORT>(Port));
-        if (!b) {
-            luaL_error(L, "Could not connect to the Server");
-            return;
-        }
-        if (Port == 443)
-        {
-            pSSLClient = std::make_unique<CSSLClient>(pActiveSock.get());
-            pSSLClient->ServerCertAcceptable = CertAcceptable;
-            pSSLClient->SelectClientCertificate = SelectClientCertificate;
-            HRESULT hr = pSSLClient->Initialize(HostW.c_str());
-            if (!SUCCEEDED(hr))
-                luaL_error(L, "Failed to initialize SSL");
         }
     }
     bool closed() {
@@ -1504,7 +1397,7 @@ int luaopen_network(lua_State* L) {
     lua_asyncclass(L);
 
     lua_newtable(L);
-    lua_pushstring(L, "network 0.3.0");
+    lua_pushstring(L, "network 0.4.0");
     lua_setfield(L, -2, "_VERSION");
     lua_newtable(L);
     lua_pushboolean(L, true); lua_setfield(L, -2, "structured_response");
@@ -1513,6 +1406,11 @@ int luaopen_network(lua_State* L) {
     lua_pushboolean(L, true); lua_setfield(L, -2, "large_tls_writes");
     lua_pushboolean(L, true); lua_setfield(L, -2, "response_limits");
     lua_pushboolean(L, true); lua_setfield(L, -2, "listener_bind_address");
+    // TB-287: TLS is chosen by `ssl`, on any port, and certificates are verified.
+    lua_pushboolean(L, true); lua_setfield(L, -2, "ssl_any_port");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "tls_verify");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "ca_file");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "sni_override");
     lua_setfield(L, -2, "capabilities");
     lua_pushcfunction(L, WebRequest);
     lua_setfield(L, -2, "send");

@@ -16,23 +16,11 @@ HRESULT CertFindByName(PCCERT_CONTEXT & pCertContext, const LPCWSTR pszSubjectNa
 // defined in source file CreateCertificate.cpp
 PCCERT_CONTEXT CreateCertificate(bool MachineCert = false, LPCWSTR Subject = nullptr, LPCWSTR FriendlyName = nullptr, LPCWSTR Description = nullptr, bool forClient = false);
 
-static bool CertAcceptable(PCCERT_CONTEXT pCertContext, const bool trusted, const bool matchingName)
-{
-	//std::wcout << GetCertName(pCertContext) << "\t" << trusted << "\t" << matchingName << std::endl;
-	//if (!trusted) {
-    //    std::wcout << L"Certificate is not trusted" << std::endl;
-	//	return false;
-	//}
-	//if (!matchingName) {
-    //    std::wcout << L"Certificate name does not match" << std::endl;
-	//	return false;
-	//}
-	//if (GetCertName(pCertContext).find(L".zenbot.gg") == std::wstring::npos
-	// && GetCertName(pCertContext).find(L"sni.cloudflaressl.com") == std::wstring::npos) {
-	//	return false;
-	//}
-	return true; // Any certificate will do
-}
+// TB-287: the "any certificate will do" callback that used to live here is gone.
+// Every TLS connection the module opens now goes through socket/TlsVerify.h,
+// which builds the chain, matches the name, and refuses a handshake whose
+// certificate was never checked at all. `tls_verify = false` on a request is
+// the explicit opt-out; see README.md.
 
 static SECURITY_STATUS SelectClientCertificate(PCCERT_CONTEXT& pCertContext, SecPkgContext_IssuerListInfoEx* pIssuerListInfo, bool Required)
 {

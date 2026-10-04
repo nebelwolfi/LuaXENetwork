@@ -26,12 +26,18 @@ public:
 		return m_Event;
 	}
 
-	~CEventWrapper()
+	void Close()
 	{
 		if (m_Event)
 		{
 			CloseHandle(m_Event);
+			m_Event = nullptr;
 		}
+	}
+
+	~CEventWrapper()
+	{
+		Close();
 	}
 
 private:

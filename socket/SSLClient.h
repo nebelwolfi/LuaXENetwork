@@ -30,6 +30,10 @@ public:
 	std::function<SECURITY_STATUS(PCCERT_CONTEXT & pCertContext, SecPkgContext_IssuerListInfoEx * pIssuerListInfo, bool Required)> SelectClientCertificate;
 	bool getServerCertNameMatches() const;
 	bool getServerCertTrusted() const;
+	// TB-287: what SSPI said when the handshake failed. A bare SEC_E_INTERNAL_ERROR
+	// is not diagnosable, and the extended error carries the real reason.
+	DWORD LastSecurityStatus() const { return static_cast<DWORD>(m_LastSecurityStatus); }
+	const std::wstring& LastExtendedError() const { return m_LastExtendedError; }
 
 private:
 	static PSecurityFunctionTableW g_pSSPI;
@@ -55,5 +59,8 @@ private:
 	int RecvPartialEncrypted(LPVOID lpBuf, const size_t Len);
 	bool ServerCertNameMatches{ false };
 	bool ServerCertTrusted{ false };
+	SECURITY_STATUS m_LastSecurityStatus{ SEC_E_OK };
+	std::wstring m_LastExtendedError;
+	void CaptureExtendedError();
 	HRESULT DisconnectSSL();
 };
