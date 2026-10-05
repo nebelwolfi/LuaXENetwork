@@ -304,6 +304,12 @@ std::unique_ptr<Socket> SocketServer::Accept() {
 		if (rc == WSAEWOULDBLOCK) {
 			return nullptr; // non-blocking call, no request pending
 		}
+		else if (rc == WSAEINTR) {
+			// Interrupted, not failed: the connection may well be there on the
+			// next attempt, and a parked accept that reports itself readable
+			// before the accept() runs must not become a Lua error.
+			return nullptr;
+		}
 		else {
 			throw "Invalid Socket";
 		}

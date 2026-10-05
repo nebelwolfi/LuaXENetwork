@@ -1208,15 +1208,51 @@ void Listener_AsyncRun(std::unique_ptr<ListenerContext> sock, const std::string&
 
 int Listener_Accept(lua_State *L) {
     auto s = lua::check<SocketServer>(L, 1);
+    // TB-396: an optional timeout parks this call in the KERNEL until a
+    // connection is pending, instead of leaving the caller to sleep a Windows
+    // timer tick (~15.6 ms) and come back to look - the other half of the
+    // latency TB-274 measured. Both call forms take it:
+    //     server:accept(handler, timeout_ms)
+    //     server:accept(timeout_ms)        -- the async (registered) form
+    // 0 keeps today's meaning (do not wait); a negative timeout waits
+    // indefinitely. A timed call says what it did: true when it accepted and
+    // handled a connection, false when the timeout passed. An untimed call
+    // returns nothing, exactly as before.
+    int timeout_ms = 0;
+    bool timed = false;
+    if (lua_isnumber(L, 2)) {
+        timeout_ms = static_cast<int>(lua_tointeger(L, 2));
+        timed = true;
+        lua_settop(L, 1);   // no handler: this is the async form
+    } else if (lua_gettop(L) >= 3 && lua_isnumber(L, 3)) {
+        timeout_ms = static_cast<int>(lua_tointeger(L, 3));
+        timed = true;
+        lua_settop(L, 2);   // [2] = handler, as the pcall below expects
+    }
+    if (timed && timeout_ms != 0 && !s->WaitReadable(timeout_ms < 0 ? -1 : timeout_ms)) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    // A timed call whose connection turned out not to be there (the wait was
+    // interrupted, or the peer gave up between the wait and the accept) is a
+    // timeout as far as the caller is concerned - never a silent success.
+    auto answer = [timed](lua_State* L, bool accepted) -> int {
+        if (!timed) return 0;
+        lua_pushboolean(L, accepted);
+        return 1;
+    };
+
     if (lua_isnoneornil(L, 2) || !lua_isfunction(L, 2) && !lua_istable(L, 2) && !lua_isuserdata(L, 2)) {
         if (lua_rawgetp(L, LUA_REGISTRYINDEX, s) != LUA_TNIL) {
             size_t len;
             std::string buffer = { lua_tolstring(L, -1, &len), len };
             lua_pop(L, 1);
+            auto usock = s->Accept();
+            if (!usock) return answer(L, false);   // nothing pending after all
             auto sock = std::make_unique<ListenerContext>();
-            sock->Accept(s->Accept());
+            sock->Accept(std::move(usock));
             std::thread(Listener_AsyncRun, std::move(sock), std::move(buffer)).detach();
-            return 0;
+            return answer(L, true);
         }
         luaL_error(L, "No function provided");
         return 0;
@@ -1229,7 +1265,7 @@ int Listener_Accept(lua_State *L) {
     if (!usock) {
         if (s->type_ == BlockingSocket)
             luaL_error(L, "Failed to accept connection");
-        return 0;
+        return answer(L, false);
     }
 
     // [3] = socket
@@ -1272,7 +1308,7 @@ int Listener_Accept(lua_State *L) {
         sock->close();
     }
 
-    return 0;
+    return answer(L, true);
 }
 
 int Listener_AcceptAsync(lua_State *L) {
@@ -1429,6 +1465,11 @@ int luaopen_network(lua_State* L) {
     lua_pushboolean(L, true); lua_setfield(L, -2, "ca_file");
     lua_pushboolean(L, true); lua_setfield(L, -2, "sni_override");
     lua_pushboolean(L, true); lua_setfield(L, -2, "proxy_socks5");
+    // TB-396: the accept can park in the kernel for a bounded wait, and the
+    // listener read returns as soon as the bytes are there instead of on the
+    // next Windows timer tick.
+    lua_pushboolean(L, true); lua_setfield(L, -2, "accept_timeout");
+    lua_pushboolean(L, true); lua_setfield(L, -2, "ready_read");
     lua_setfield(L, -2, "capabilities");
     lua_pushcfunction(L, WebRequest);
     lua_setfield(L, -2, "send");

@@ -137,7 +137,91 @@ Without a proxy, connection failures are `connect_refused`, `connect_timeout`,
   literal: on this platform it accepts any trusted certificate for one.
 * A handshake that completes without presenting a certificate fails.
 
-## capabilities
+## Listener: parked accept and readiness read
+
+Two costs used to sit on every request a listener served, and both were Windows
+timer ticks (~15.6 ms each), not work:
+
+* the accept loop could only ask "is a connection pending?", so a server paced
+  itself with `sleep(10)` and every request waited for that sleep;
+* `client.request` re-checked the socket once per tick, so a request that was
+  **already buffered** still cost a tick before it was parsed.
+
+Both now wait in the kernel (`WSAPoll`), which costs nothing while waiting and
+returns the moment the socket becomes ready. **No `timeBeginPeriod` is called and
+none should be**: the waits are readiness waits, not shorter sleeps.
+
+```lua
+local server = network.listen(8080, true)          -- non-blocking listener
+
+while true do
+    -- Drain whatever the kernel already has, then park for the next
+    -- connection instead of sleeping a tick. 1000 ms is an upper bound, not
+    -- a cost: the call returns the instant a connection lands.
+    local served = server:accept(handler, 0)       -- 0 = do not wait, as before
+    if not served then server:accept(handler, 1000) end
+end
+```
+
+`server:accept(handler, timeout_ms)` parks the call in the kernel until a
+connection is pending or `timeout_ms` passes.
+
+| `timeout_ms` | meaning |
+|---|---|
+| absent | do not wait; accept a pending connection or return (the old behaviour, and it still returns **no values**) |
+| `0` | the same as absent |
+| `> 0` | wait up to that long for a connection |
+| `< 0` | wait indefinitely |
+
+A **timed** call says what it did: `true` when it accepted and ran the handler,
+`false` when the timeout passed. An untimed call returns nothing, exactly as
+before, so existing callers are unaffected. A blocking listener
+(`network.listen(port, false)`) also honours the timeout: with one, it no longer
+blocks past it.
+
+The registered-function (per-connection worker) form takes the timeout in place
+of the handler:
+
+```lua
+server:async(handler)          -- one handler, runs on a thread of the module's
+while true do                  -- own, in a Lua state of its own
+    server:accept(1000)        -- park; true when a connection was taken
+end
+```
+
+**The request read is readiness-based.** `client.request` returns as soon as the
+request is buffered - microseconds, not a tick - and as soon as the rest of a
+split header or body arrives, still bounded by the same 1000 ms it always had
+(a peer that says nothing yields `nil` in about a second, a peer that is cut off
+mid-header still raises `Incomplete or oversized HTTP request header`).
+`client:receive(n)` still waits for all `n` bytes, as it always did.
+
+Measured on loopback (Windows, 120 sequential `Connection: close` requests from a
+.NET client with `NoDelay`, and 4 concurrent client streams x 120 requests):
+
+| | before | after |
+|---|---|---|
+| round trip, p50 | 30.0 ms | **0.68 ms** (parked) / 14.5 ms (same loop, still `sleep(10)`) |
+| round trip, p95 | 31.8 ms | **1.03 ms** |
+| `client.request` read, p50 | 15.4 ms | **0.02 ms** |
+| 4 concurrent streams, p50 / p95 | 61.4 / 62.9 ms | **1.00 / 1.43 ms** |
+| server idle CPU | 0.016 s / 10 s | 0.000 s / 10 s |
+
+Both are plain-socket paths. TLS reads go through `CSSLClient::Recv` /
+`CActiveSock::Recv` with a socket receive timeout, not through this wait, and a
+listener socket cannot be a TLS socket: `ListenerContext` owns a `Socket`.
+
+Known limitations, unchanged by this:
+
+* `CBaseSock::ReceiveBytes` (`socket/BaseSock.cpp`) still has the old tick and
+  has no caller at all. It must **not** be pointed at `Socket::WaitReadable` if
+  it is ever revived on the SSL client, where `FIONREAD` counts encrypted bytes.
+* `server:async` accepts the connection and reports `true`, but the worker
+  thread does not answer the client on this build (verified against the base
+  commit as well, with a handler that touches nothing: no response, no error).
+  The parked accept in front of it works; what happens after it does not.
+
+
 
 ```lua
 network.capabilities.ssl_any_port    -- true: ssl decides TLS on any port
@@ -151,6 +235,8 @@ network.capabilities.request_timeouts
 network.capabilities.large_tls_writes
 network.capabilities.response_limits
 network.capabilities.listener_bind_address
+network.capabilities.accept_timeout   -- accept(handler, timeout_ms) parks
+network.capabilities.ready_read       -- the listener read is readiness-based
 ```
 
 ## Building
