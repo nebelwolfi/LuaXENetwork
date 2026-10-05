@@ -14,6 +14,8 @@
 #include "misc/misc.h"
 
 #include <cmath>
+#include <cstdio>
+#include <limits>
 #include <codecvt>
 #include "misc/md5.h"
 #include <memory>
@@ -1215,9 +1217,18 @@ void Listener_AsyncRun(std::unique_ptr<ListenerContext> sock, const std::string&
 // 0 would quietly turn it into "do not wait".
 static void AcceptTimeoutArg(lua_State* L, int index, int& out) {
     const lua_Number raw = lua_tonumber(L, index);
-    if (raw != std::floor(raw) || raw < -2147483648.0 || raw > 2147483647.0)
-        luaL_error(L, "accept: expected a whole number of milliseconds between "
-                      "-2147483648 and 2147483647, got %s", lua_tostring(L, index));
+    if (raw != std::floor(raw)
+        || raw < static_cast<lua_Number>(std::numeric_limits<int>::min())
+        || raw > static_cast<lua_Number>(std::numeric_limits<int>::max())) {
+        // The value is copied into a plain buffer first: lua_tostring on a number
+        // rewrites the argument slot in place, and the two error paths of this
+        // function should leave the caller's stack the way they found it.
+        char shown[64];
+        std::snprintf(shown, sizeof(shown), "%g", static_cast<double>(raw));
+        luaL_error(L, "accept: expected a whole number of milliseconds in [%d, %d], got %s",
+            std::numeric_limits<int>::min(), std::numeric_limits<int>::max(), shown);
+        return;   // unreachable; luaL_error does not return
+    }
     out = static_cast<int>(raw);
 }
 
@@ -1235,12 +1246,16 @@ int Listener_Accept(lua_State *L) {
     // returns nothing, exactly as before.
     int timeout_ms = 0;
     bool timed = false;
+    // Checked FIRST, before any branch below trims the stack: a stray fourth
+    // argument must be refused, not silently dropped by a lua_settop.
+    if (lua_gettop(L) > 3)
+        return luaL_argerror(L, 4, "accept takes at most three arguments "
+                                   "(server, handler, timeout_ms)");
     // Slot 2 is a handler only if it is a real function, table or userdata.
     // lua_isnumber() is not used for that test because it is ALSO true for a
     // numeric string, and `accept("1000")` must keep meaning what it meant
     // before (the registered-function form, with the string ignored) instead of
     // silently becoming a wait.
-    const bool handler_slot = lua_isfunction(L, 2) || lua_istable(L, 2) || lua_isuserdata(L, 2);
     if (lua_type(L, 2) == LUA_TNUMBER) {
         // accept(timeout_ms): the async form, with a bounded wait.
         AcceptTimeoutArg(L, 2, timeout_ms);
@@ -1250,15 +1265,30 @@ int Listener_Accept(lua_State *L) {
         AcceptTimeoutArg(L, 3, timeout_ms);
         timed = true;
         lua_settop(L, 2);   // [2] = handler, as the pcall below expects
-    } else if (handler_slot) {
+    } else if (lua_isfunction(L, 2) || lua_istable(L, 2) || lua_isuserdata(L, 2)) {
         // The handler form keeps exactly two arguments. A third argument would
-        // sit under the pcall's results, and `lua_gettop(L) > 2` below takes
+        // sit under the pcall's results, and `lua_gettop(L) > 2` below reads
         // everything above the socket as the handler's RESPONSE - so a stray
-        // option would be sent to the client as the response body. Refuse it
+        // option would either be sent to the client as the body (if it is
+        // callable) or become the function the pcall tries to call. Refuse it
         // instead of guessing.
         if (lua_gettop(L) > 2 && !lua_isnoneornil(L, 3))
             return luaL_argerror(L, 3, "expected a timeout in milliseconds");
         lua_settop(L, 2);
+    }
+    // Is there anything to run at all? The registered-function form keeps its
+    // handler in the registry under the server, and the answer is asked for
+    // BEFORE the park: `accept(nil, -1)` with nothing registered is a typo, and
+    // it must not cost the caller a wait that has no end.
+    // lua_rawgetp pushes the value even when it is nil, so it is popped on
+    // EVERY path: a nil left behind here would end up under the socket below
+    // and become the function the pcall calls.
+    const bool registered = lua_rawgetp(L, LUA_REGISTRYINDEX, s) != LUA_TNIL;
+    lua_pop(L, 1);
+    if (!registered
+        && (lua_isnoneornil(L, 2) || !lua_isfunction(L, 2) && !lua_istable(L, 2) && !lua_isuserdata(L, 2))) {
+        luaL_error(L, "No function provided");
+        return 0;
     }
     if (timed && timeout_ms != 0 && !s->WaitReadable(timeout_ms < 0 ? -1 : timeout_ms)) {
         lua_pushboolean(L, false);
@@ -1267,9 +1297,9 @@ int Listener_Accept(lua_State *L) {
     // A timed call whose connection turned out not to be there (the wait was
     // interrupted, or the peer gave up between the wait and the accept) is a
     // timeout as far as the caller is concerned - never a silent success.
-    auto answer = [timed](lua_State* L, bool accepted) -> int {
+    auto answer = [timed](lua_State* state, bool accepted) -> int {
         if (!timed) return 0;
-        lua_pushboolean(L, accepted);
+        lua_pushboolean(state, accepted);
         return 1;
     };
 

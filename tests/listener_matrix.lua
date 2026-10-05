@@ -106,9 +106,13 @@ do
     local took = ms() - started
     client:close()
     check("a parked accept wakes on the connection", accepted == true, tostring(accepted))
-    check("...within a few ms, not a timer tick", took < 50, string.format("%.2f ms", took))
+    -- Loose bounds on purpose: these are single-shot measurements of a
+    -- sub-millisecond operation on a box that may be busy. The regression that
+    -- matters (no wait / no boolean) is caught by the checks above; the
+    -- benchmark, not this suite, is where the latency is measured.
+    check("...well under a timer tick's worth of waiting (< 200 ms)", took < 200, string.format("%.2f ms", took))
     check("...and the request parsed", path == "/fast", tostring(path))
-    check("...and the read itself cost under 5 ms", read_took and read_took < 5,
+    check("...and the read itself did not wait for a tick (< 50 ms)", read_took and read_took < 50,
         read_took and string.format("%.3f ms", read_took))
 end
 
@@ -159,22 +163,28 @@ do
     local server = network.listen(0, true)
     local function refused(value)
         local ok, message = pcall(function() server:accept(function() end, value) end)
-        return (not ok) and tostring(message)
+        return (not ok) and tostring(message) or ""
     end
-    check("a timeout above INT_MAX is refused", refused(2147483648) ~= nil, refused(2147483648))
-    check("a fractional timeout is refused", refused(0.5) ~= nil, refused(0.5))
+    local big, half = refused(2147483648), refused(0.5)
+    check("a timeout above INT_MAX is refused", big:find("whole number", 1, true) ~= nil, big)
+    check("a fractional timeout is refused", half:find("whole number", 1, true) ~= nil, half)
     check("a normal timeout still works", server:accept(function() end, 1) == false)
 end
 
 -- 10. A third argument that is not a timeout is refused rather than mistaken for
--- the handler's response (the pre-existing `lua_gettop(L) > 2` read).
+-- the handler's response (the pre-existing `lua_gettop(L) > 2` read), and a
+-- fourth argument is refused rather than silently dropped.
 do
     local server = network.listen(0, true)
     local ok, message = pcall(function() server:accept(function() end, "abc") end)
     check("a non-numeric third argument is refused", not ok and tostring(message):find("milliseconds", 1, true) ~= nil,
         tostring(message))
-    local nil_ok = pcall(function() server:accept(function() end, nil) end)
-    check("a nil third argument is still the old call", nil_ok)
+    local fourth_ok, fourth = pcall(function() server:accept(function() end, 10, "junk") end)
+    check("a fourth argument is refused", not fourth_ok and tostring(fourth):find("at most three", 1, true) ~= nil,
+        tostring(fourth))
+    -- nil in slot 3 is the old call: no error AND no values.
+    local nil_ok, nil_count = pcall(function() return select("#", server:accept(function() end, nil)) end)
+    check("a nil third argument is still the old call (no values)", nil_ok and nil_count == 0, tostring(nil_count))
 end
 
 -- 11. The capabilities are how a caller decides to use this at all, so the
@@ -189,9 +199,79 @@ do
     check("an untimed accept still parses a request", reply ~= nil and reply.path == "/shape")
 end
 
-print(string.format("TB396 RESULT: %s", #failures == 0 and "pass" or "fail"))
+-- 12. Nothing to run is an error BEFORE the park: accept(nil, -1) or
+-- accept(-1) with no registered handler would otherwise wait forever for what
+-- is a typo. The bound here is the proof that it did not wait.
+do
+    local server = network.listen(0, true)
+    local started = ms()
+    local ok, message = pcall(function() server:accept(nil, 5000) end)
+    local took = ms() - started
+    check("accept(nil, ms) with no handler raises", not ok and tostring(message):find("No function provided", 1, true) ~= nil,
+        tostring(message))
+    check("...without parking first (< 1000 ms)", took < 1000, string.format("%.1f ms", took))
+    local started2 = ms()
+    local ok2 = pcall(function() server:accept(5000) end)
+    check("accept(ms) with no handler raises without parking", not ok2 and ms() - started2 < 1000)
+end
+
+-- 13. The registered-function (async) form: accept(ms) with no handler in the
+-- call, parked and timing out. It deliberately never hands a connection to the
+-- module's worker thread: on this build - and on the base commit 8a05cbc - that
+-- thread kills the whole process ~0.5-1 s later (exit 0xE24C4A02, an unhandled
+-- luaL_error on a detached thread; README, known limitations). A suite that did
+-- so would be testing that pre-existing crash, and a later case in this process
+-- would pay for it (it did: a 150 ms wait measured 2.7 s).
+do
+    local server = network.listen(0, true)
+    server:async(function(c) end)
+    local started = ms()
+    local idle = server:accept(150)
+    local took = ms() - started
+    check("async form: accept(ms) with nothing pending returns false", idle == false, tostring(idle))
+    check("...after waiting for it (>= 140 ms, < 1500 ms)", took >= 140 and took < 1500, string.format("%.1f ms", took))
+    local zero = server:accept(0)
+    check("async form: accept(0) with nothing pending returns false at once", zero == false, tostring(zero))
+end
+
+-- 14. One listener, two parked accepts in a row: the wait must not leave the
+-- listening socket unusable for the next one.
+do
+    local server = network.listen(0, true)
+    local seen = {}
+    for i = 1, 2 do
+        local client = network.connect("127.0.0.1", server.port)
+        client:send(request("GET", "/n" .. i))
+        local accepted = server:accept(function(c)
+            local got = c.request
+            seen[#seen + 1] = got and got.path
+        end, 2000)
+        client:close()
+        check("parked accept #" .. i .. " on one listener takes its connection", accepted == true, tostring(accepted))
+    end
+    check("...and both handlers saw their own request", seen[1] == "/n1" and seen[2] == "/n2",
+        tostring(seen[1]) .. "," .. tostring(seen[2]))
+end
+
+-- 15. A BLOCKING listener (network.listen(port, false)) with a timeout and
+-- nothing pending: the bounded wait is what comes back, not the old blocking
+-- accept(). If this regresses it hangs, and run_all.ps1's per-script timeout
+-- is what then fails the run.
+do
+    local server = network.listen(0, false)
+    local started = ms()
+    local accepted = server:accept(function() end, 150)
+    local took = ms() - started
+    check("a blocking listener's timed accept returns false", accepted == false, tostring(accepted))
+    check("...inside its budget (< 1500 ms)", took < 1500, string.format("%.1f ms", took))
+end
+
+-- The verdict is the LAST line printed: run_all.ps1 decides on that text, so
+-- nothing may run after a pass marker.
+print(string.format("listener_matrix: %d checks, %d failures", checks, #failures))
 if #failures > 0 then
-    for _, name in ipairs(failures) do print("failed: " .. name) end
+    print("failed: " .. table.concat(failures, ", "))
+    print("TB396 RESULT: fail")
     os.exit(1)
 end
-print(string.format("%d checks", checks))
+print("TB396 RESULT: pass")

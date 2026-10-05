@@ -169,8 +169,8 @@ connection is pending or `timeout_ms` passes.
 | `timeout_ms` | meaning |
 |---|---|
 | absent | do not wait; accept a pending connection or return. Returns **no values**, exactly as it always did |
-| `0` | the same wait as absent, but the call reports: `true`/`false` |
-| `> 0` | wait up to that long for a connection |
+| `0` | the same (no) wait as absent, but the call reports `true`/`false` |
+| `> 0` | wait up to that long for a connection (past a few minutes this is, in practice, the same as `< 0`) |
 | `< 0` | wait indefinitely |
 
 A **timed** call says what it did: `true` when it accepted a connection and ran
@@ -179,49 +179,55 @@ or because the connection it waited for was gone by the time it took it. An
 untimed call returns nothing, so existing callers are unaffected.
 
 The timeout must be a whole number of milliseconds that fits in a signed 32-bit
-integer; anything else (0.5, 2147483648, "1000") is an argument error rather than
-a silent wrap into a different wait.
+integer; a fractional or out-of-range number (0.5, 2147483648) is an argument
+error rather than a silent wrap into a different wait. A numeric *string* in the
+handler slot keeps its old meaning (it is not a timeout), a non-number third
+argument and any fourth argument are refused, and a call with nothing to run -
+no handler and none registered with `async` - raises `No function provided`
+**before** it would wait, so `accept(nil, -1)` cannot park forever on a typo.
 
 **A parked accept blocks the whole Lua state** for up to `timeout_ms`: this is a
 blocking C call, so nothing else in that state runs while it waits, and there is
 no `SocketServer:close()` to interrupt it. Use it from the state that owns the
 accept loop, and treat a negative timeout as "until a connection arrives".
 
-A blocking listener (`network.listen(port, false)`) waits for a *pending*
-connection within the timeout and then takes the old blocking `accept()`; if that
-connection disappears in between, the accept itself can still block. On a
-non-blocking listener - what the module returns for `true` - nothing can block.
+A blocking listener (`network.listen(port, false)`) with a positive timeout waits
+for a *pending* connection within the timeout and then takes the old blocking
+`accept()`; if that connection disappears in between, the accept itself can still
+block. With `0` (or no timeout) there is no wait to bound anything, and a
+blocking listener's `accept()` does not return until a client connects - exactly
+as before. A non-blocking listener - what the module returns for `true` - never
+blocks outside the wait you asked for.
 
-The registered-function (per-connection worker) form takes the timeout in place
-of the handler:
-
-```lua
-server:async(handler)          -- one handler, runs on a thread of the module's
-while true do                  -- own, in a Lua state of its own
-    server:accept(1000)        -- park; true when a connection was taken
-end
-```
+The registered-function form takes the timeout in place of the handler,
+`server:accept(1000)`, with the same return values. **Its worker thread crashes
+the process on this build (pre-existing, see the known limitations below), so the
+form is documented for completeness, not recommended.**
 
 **The request read is readiness-based.** `client.request` returns as soon as the
 request is buffered - microseconds, not a tick - and as soon as the rest of a
 split header or body arrives, still bounded by the same 1000 ms it always had
 (a peer that says nothing yields `nil` in about a second, a peer that is cut off
 mid-header still raises `Incomplete or oversized HTTP request header`).
-`client:receive(n)` still waits for all `n` bytes, as it always did.
+`client:receive(n)` still waits for all `n` bytes, as it always did, and still
+has no deadline: the peer has to send them or close. While nothing is buffered it
+now parks at no CPU cost; while some but fewer than `n` bytes are buffered it
+re-checks once per timer tick, because no readiness wait can wait for "more".
 
-Measured on loopback (Windows, 120 sequential `Connection: close` requests from a
-.NET client with `NoDelay`, and 4 concurrent client streams x 120 requests):
+Measured on loopback (Windows, `tests`-independent harness: a .NET client with
+`NoDelay`, sequential `Connection: close` requests after 20 warm-ups; every
+"after" number is from the final build and one run per row):
 
-| | before | after |
+| | before (base `8a05cbc`) | after |
 |---|---|---|
-| round trip, p50 | 30.0 ms | **0.68 ms** (parked) / 14.5 ms (same loop, still `sleep(10)`) |
-| round trip, p95 | 31.8 ms | **1.03 ms** |
-| `client.request` read, p50 / p95 | 15.4 / 16.2 ms | **0.16 / 0.43 ms** |
-| 4 concurrent streams, p50 / p95 | 61.4 / 62.9 ms | **1.00 / 1.43 ms** |
-| server idle CPU | 0.016 s / 10 s | 0.000 s / 10 s |
+| round trip p50 / p95, 200 requests, parked loop | 30.0 / 31.8 ms | **0.62 / 0.94 ms** |
+| round trip p50 / p95, same loop still on `sleep(10)` | 30.0 / 31.8 ms | 14.5 / 15.4 ms |
+| `client.request` read p50 / p95, parked loop | 15.4 / 16.3 ms | **0.30 / 0.47 ms** |
+| 4 concurrent streams x 120 requests, p50 / p95 | 61.4 / 62.9 ms | **1.00 / 1.43 ms** |
+| server CPU over 10 s idle | 0.016 s | 0.000 s |
 
-(0.019 ms p50 is the same read in a loop that still paces with `sleep(10)`, where
-the request is buffered before the accept.)
+The `sleep(10)` row is the read fix on its own: half the floor goes, the other
+half is the loop's own pacing tick, which only the parked accept removes.
 
 Both are plain-socket paths. TLS reads go through `CSSLClient::Recv` /
 `CActiveSock::Recv` with a socket receive timeout, not through this wait, and a
@@ -232,20 +238,29 @@ Known limitations, unchanged by this:
 * `CBaseSock::ReceiveBytes` (`socket/BaseSock.cpp`) still has the old tick and
   has no caller at all. It must **not** be pointed at `Socket::WaitReadable` if
   it is ever revived on the SSL client, where `FIONREAD` counts encrypted bytes.
-* `server:async` accepts the connection and reports `true`, but the worker
-  thread does not answer the client on this build (verified against the base
-  commit as well, with a handler that touches nothing: no response, no error).
-  The parked accept in front of it works; what happens after it does not. Two
-  more reasons not to lean on it: a handler is shipped as dumped bytecode into a
+* **`server:async` crashes the process.** Handing a connection to its worker
+  thread ends the whole process about half a second to a second later with exit
+  code `0xE24C4A02` (LuaJIT's code for an error raised with no handler): the
+  thread's protected call fails and the failure is reported with `luaL_error` on
+  a detached thread, where nothing can catch it. Reproduced identically on the
+  base commit `8a05cbc` with a handler that does nothing (`function(c) end`), so
+  it is not from this change; the parked `accept(timeout_ms)` in front of it
+  works, and `tests/listener_matrix.lua` covers only that part on purpose. Two
+  more constraints of the form: a handler is shipped as dumped bytecode into a
   fresh state, so it cannot have upvalues and sees none of the registering
-  state's globals, and an error inside that thread is a `luaL_error` on a
-  detached thread, which aborts the process rather than raising.
+  state's globals. **Do not use `server:async` until this is fixed** - girl's
+  own per-connection workers (TB-320) do not use it.
 * `SocketServer::Accept` still throws a `const char*` for an accept error other
   than "would block" and "interrupted"; that escapes the Lua C call and ends the
   process. Pre-existing, and untouched here.
 * There is no `close` on a listener: a parked accept can only be waited out.
+* Listener and connection userdata are freed without their C++ destructor
+  running (`lua::alloc` + the binding's `__gc`), so a `network.listen` socket and
+  an accepted socket are never `closesocket`-ed before the process exits. A
+  server that creates listeners repeatedly leaks one handle each time.
+  Pre-existing; out of scope for this change.
 
-
+## capabilities
 
 ```lua
 network.capabilities.ssl_any_port    -- true: ssl decides TLS on any port
@@ -297,7 +312,9 @@ fixture cannot start and the run fails loudly - it never silently skips.
 
 The work directory is `$GIRL_SCRATCH/network-tests-<pid>` when that is set and
 `<module>/tmp/network-tests-<pid>` otherwise, and it is deleted at the end of the
-run unless `-KeepWork` is given. `tests/tls_matrix.lua` covers TLS (29 checks) and
-`tests/proxy_matrix.lua` the proxy (38). A check that cannot run on this machine -
+run unless `-KeepWork` is given. `tests/tls_matrix.lua` covers TLS (32 checks),
+`tests/proxy_matrix.lua` the proxy (48) and `tests/listener_matrix.lua` the parked
+accept and the readiness read (TB-396; it needs no fixture - every case is a
+loopback listener and client inside the script). A check that cannot run on this machine -
 the fixed ports 443 and 8443 when something else holds them - prints `SKIP` and is
 listed in the summary; it never passes silently.
