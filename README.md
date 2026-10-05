@@ -220,10 +220,10 @@ Measured on loopback (Windows, `tests`-independent harness: a .NET client with
 
 | | before (base `8a05cbc`) | after |
 |---|---|---|
-| round trip p50 / p95, 200 requests, parked loop | 30.0 / 31.8 ms | **0.62 / 0.94 ms** |
-| round trip p50 / p95, same loop still on `sleep(10)` | 30.0 / 31.8 ms | 14.5 / 15.4 ms |
-| `client.request` read p50 / p95, parked loop | 15.4 / 16.3 ms | **0.30 / 0.47 ms** |
-| 4 concurrent streams x 120 requests, p50 / p95 | 61.4 / 62.9 ms | **1.00 / 1.43 ms** |
+| round trip p50 / p95, 200 requests, parked loop | 30.1 / 31.2 ms | **0.63 / 1.14 ms** |
+| round trip p50 / p95, same loop still on `sleep(10)` | 30.1 / 31.2 ms | 14.5 / 15.6 ms |
+| `client.request` read p50 / p95, parked loop | 15.7 / 16.4 ms | **0.29 / 0.48 ms** |
+| 4 concurrent streams x 120 requests, p50 / p95 | 61.5 / 62.9 ms | **1.28 / 1.87 ms** |
 | server CPU over 10 s idle | 0.016 s | 0.000 s |
 
 The `sleep(10)` row is the read fix on its own: half the floor goes, the other
