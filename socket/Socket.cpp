@@ -1,5 +1,7 @@
 #include "Socket.h"
 
+#include <algorithm>
+#include <climits>
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -87,12 +89,55 @@ bool Socket::Closed() {
     return false;
 }
 
+// TB-396: wait until this socket has something to read - data, EOF or an error
+// - or until timeoutMs passes. A negative timeout waits indefinitely. Unlike the
+// sleep_for(1ms) this replaces, the wait happens in the kernel: it costs nothing
+// while it waits and it returns the instant the socket becomes readable, so no
+// caller pays a Windows timer tick (~15.6 ms) on top of its own latency.
+bool Socket::WaitReadable(int timeoutMs) {
+	if (closed || s_ == INVALID_SOCKET) return false;
+	WSAPOLLFD descriptor{};
+	descriptor.fd = s_;
+	descriptor.events = POLLRDNORM;
+	// POLLHUP and POLLERR are reported whatever the events mask asks for, so a
+	// peer that closes or resets mid-request wakes this instead of sitting out
+	// the timeout. revents is deliberately not read: the caller re-probes and
+	// recognises EOF for itself.
+	const auto started = std::chrono::steady_clock::now();
+	for (;;) {
+		int wait = timeoutMs;
+		if (timeoutMs >= 0) {
+			// Every attempt gets what is LEFT of the budget, so an interrupted
+			// wait cannot stretch it. A 0 budget is the caller polling.
+			const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - started).count();
+			const long long remaining = static_cast<long long>(timeoutMs) - spent;
+			if (remaining <= 0) return false;
+			wait = static_cast<int>(std::min<long long>(remaining, INT_MAX));
+		}
+		const int ready = WSAPoll(&descriptor, 1, wait);
+		if (ready > 0) return true;
+		if (ready == SOCKET_ERROR) {
+			// WSAEINTR is this thread being interrupted, not the socket
+			// failing: wait again with what is left of the budget rather than
+			// report a dead connection that is still there.
+			if (WSAGetLastError() == WSAEINTR) continue;
+			// Deliberately NOT `closed = true`: Close() only closes a socket it
+			// believes is still open, so claiming it closed here would skip the
+			// closesocket and leak the handle. A socket that really died is
+			// reported by the caller's next ioctlsocket.
+			return false;
+		}
+		return false;   // timed out (0)
+	}
+}
+
 std::string Socket::ReceiveBytes(unsigned long max_recv, unsigned long timeoutMs) {
 	std::string ret;
     unsigned long can_recv = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
 
-    while (!can_recv || can_recv < max_recv) {
+    for (;;) {
         int ctl = ioctlsocket(s_, FIONREAD, &can_recv);
         if (ctl == SOCKET_ERROR) {
             return "";
@@ -103,9 +148,35 @@ std::string Socket::ReceiveBytes(unsigned long max_recv, unsigned long timeoutMs
             if (peek == 0) { closed = true; return ""; }
             if (peek == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) return "";
         }
+        // max_recv == 0 means "whatever has arrived", so one byte is enough;
+        // otherwise the caller asked for a count that must be buffered before
+        // anything is consumed. Either way, once this holds there is nothing to
+        // wait for and nothing to sleep for.
+        const bool satisfied = max_recv ? (can_recv >= max_recv) : (can_recv > 0);
+        if (satisfied) break;
         if (timeoutMs && std::chrono::steady_clock::now() >= deadline) return "";
-        //printf("ioctlsocket returned %d, max_recv = %d\n", ctl, max_recv);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (can_recv > 0) {
+            // Something IS readable, just not the count the caller asked for,
+            // and no readiness primitive can wait for "more": the socket is
+            // readable RIGHT NOW, so WSAPoll would return immediately and this
+            // loop would spin a core at it. This is the one state that keeps
+            // the paced re-check - the old sleep - because it cannot park.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        // Park in the kernel for the rest. The deadline above already rejected
+        // an expired budget, so this is always time that is actually left; a 0
+        // timeout still means "wait indefinitely", now parked instead of
+        // spinning.
+        int remaining = -1;
+        if (timeoutMs) {
+            // Rounded UP: truncating would turn the last fraction of a
+            // millisecond into a 0 (poll) budget and spin the tail out.
+            const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            remaining = left > 0 ? static_cast<int>(std::min<long long>(left, INT_MAX)) : 0;
+        }
+        WaitReadable(remaining);
     }
     if (can_recv && !max_recv)
         max_recv = can_recv;
@@ -232,6 +303,12 @@ std::unique_ptr<Socket> SocketServer::Accept() {
 		int rc = WSAGetLastError();
 		if (rc == WSAEWOULDBLOCK) {
 			return nullptr; // non-blocking call, no request pending
+		}
+		else if (rc == WSAEINTR) {
+			// Interrupted, not failed: the connection may well be there on the
+			// next attempt, and a parked accept that reports itself readable
+			// before the accept() runs must not become a Lua error.
+			return nullptr;
 		}
 		else {
 			throw "Invalid Socket";

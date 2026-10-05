@@ -23,6 +23,14 @@ public:
 	std::string ReceiveLine();
 	std::string ReceiveBytes(unsigned long, unsigned long timeoutMs = 0);
 
+	// TB-396: park in the kernel until this socket is readable (data, EOF or an
+	// error) or the timeout passes. A negative timeout waits indefinitely, 0
+	// polls. This is the wait the listener side uses - the accepted-socket
+	// reads and the accept wait both go through it - so neither pays a Windows
+	// timer tick to notice that something arrived. (SocketSelect below is the
+	// module's older select-based twin and is not on that path.)
+	bool WaitReadable(int timeoutMs);
+
 	void   Close();
 
 	int   SendBytes(std::string&&);

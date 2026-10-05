@@ -70,7 +70,8 @@ function Invoke-Script {
     # The verdict is the line the script prints, not the process exit code:
     # with output redirected, a child that exits 0 is not reliably reported as 0
     # here (an earlier version of this runner called a passing suite a failure).
-    $ok = $text -match '(?m)^\s*TB287 RESULT: pass\s*$'
+    # TB-396's listener_matrix.lua prints its own TB396 marker, as its last line.
+    $ok = $text -match '(?m)^\s*TB(287|396) RESULT: pass\s*$'
     if (-not $ok) { $exitCode = 1 }
     $results.Add([pscustomobject]@{ Name = (Split-Path -Leaf $ScriptPath); Ok = $ok; Seconds = $seconds })
 }
