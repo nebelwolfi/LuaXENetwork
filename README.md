@@ -168,16 +168,29 @@ connection is pending or `timeout_ms` passes.
 
 | `timeout_ms` | meaning |
 |---|---|
-| absent | do not wait; accept a pending connection or return (the old behaviour, and it still returns **no values**) |
-| `0` | the same as absent |
+| absent | do not wait; accept a pending connection or return. Returns **no values**, exactly as it always did |
+| `0` | the same wait as absent, but the call reports: `true`/`false` |
 | `> 0` | wait up to that long for a connection |
 | `< 0` | wait indefinitely |
 
-A **timed** call says what it did: `true` when it accepted and ran the handler,
-`false` when the timeout passed. An untimed call returns nothing, exactly as
-before, so existing callers are unaffected. A blocking listener
-(`network.listen(port, false)`) also honours the timeout: with one, it no longer
-blocks past it.
+A **timed** call says what it did: `true` when it accepted a connection and ran
+the handler, `false` when it accepted nothing - either because the timeout passed
+or because the connection it waited for was gone by the time it took it. An
+untimed call returns nothing, so existing callers are unaffected.
+
+The timeout must be a whole number of milliseconds that fits in a signed 32-bit
+integer; anything else (0.5, 2147483648, "1000") is an argument error rather than
+a silent wrap into a different wait.
+
+**A parked accept blocks the whole Lua state** for up to `timeout_ms`: this is a
+blocking C call, so nothing else in that state runs while it waits, and there is
+no `SocketServer:close()` to interrupt it. Use it from the state that owns the
+accept loop, and treat a negative timeout as "until a connection arrives".
+
+A blocking listener (`network.listen(port, false)`) waits for a *pending*
+connection within the timeout and then takes the old blocking `accept()`; if that
+connection disappears in between, the accept itself can still block. On a
+non-blocking listener - what the module returns for `true` - nothing can block.
 
 The registered-function (per-connection worker) form takes the timeout in place
 of the handler:
@@ -203,9 +216,12 @@ Measured on loopback (Windows, 120 sequential `Connection: close` requests from 
 |---|---|---|
 | round trip, p50 | 30.0 ms | **0.68 ms** (parked) / 14.5 ms (same loop, still `sleep(10)`) |
 | round trip, p95 | 31.8 ms | **1.03 ms** |
-| `client.request` read, p50 | 15.4 ms | **0.02 ms** |
+| `client.request` read, p50 / p95 | 15.4 / 16.2 ms | **0.16 / 0.43 ms** |
 | 4 concurrent streams, p50 / p95 | 61.4 / 62.9 ms | **1.00 / 1.43 ms** |
 | server idle CPU | 0.016 s / 10 s | 0.000 s / 10 s |
+
+(0.019 ms p50 is the same read in a loop that still paces with `sleep(10)`, where
+the request is buffered before the accept.)
 
 Both are plain-socket paths. TLS reads go through `CSSLClient::Recv` /
 `CActiveSock::Recv` with a socket receive timeout, not through this wait, and a
@@ -219,7 +235,15 @@ Known limitations, unchanged by this:
 * `server:async` accepts the connection and reports `true`, but the worker
   thread does not answer the client on this build (verified against the base
   commit as well, with a handler that touches nothing: no response, no error).
-  The parked accept in front of it works; what happens after it does not.
+  The parked accept in front of it works; what happens after it does not. Two
+  more reasons not to lean on it: a handler is shipped as dumped bytecode into a
+  fresh state, so it cannot have upvalues and sees none of the registering
+  state's globals, and an error inside that thread is a `luaL_error` on a
+  detached thread, which aborts the process rather than raising.
+* `SocketServer::Accept` still throws a `const char*` for an accept error other
+  than "would block" and "interrupted"; that escapes the Lua C call and ends the
+  process. Pre-existing, and untouched here.
+* There is no `close` on a listener: a parked accept can only be waited out.
 
 
 

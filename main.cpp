@@ -13,6 +13,7 @@
 #include <fstream>
 #include "misc/misc.h"
 
+#include <cmath>
 #include <codecvt>
 #include "misc/md5.h"
 #include <memory>
@@ -1206,6 +1207,20 @@ void Listener_AsyncRun(std::unique_ptr<ListenerContext> sock, const std::string&
     }
 }
 
+// TB-396: read an accept timeout, refusing anything that would not survive the
+// narrowing to the int WSAPoll takes. A value that does not fit would wrap to a
+// NEGATIVE one, and a negative timeout means "wait indefinitely" - so a caller's
+// 2147483648 would park the whole Lua state with no way to interrupt it. A
+// fractional value is refused rather than truncated, because 0.5 truncating to
+// 0 would quietly turn it into "do not wait".
+static void AcceptTimeoutArg(lua_State* L, int index, int& out) {
+    const lua_Number raw = lua_tonumber(L, index);
+    if (raw != std::floor(raw) || raw < -2147483648.0 || raw > 2147483647.0)
+        luaL_error(L, "accept: expected a whole number of milliseconds between "
+                      "-2147483648 and 2147483647, got %s", lua_tostring(L, index));
+    out = static_cast<int>(raw);
+}
+
 int Listener_Accept(lua_State *L) {
     auto s = lua::check<SocketServer>(L, 1);
     // TB-396: an optional timeout parks this call in the KERNEL until a
@@ -1220,14 +1235,30 @@ int Listener_Accept(lua_State *L) {
     // returns nothing, exactly as before.
     int timeout_ms = 0;
     bool timed = false;
-    if (lua_isnumber(L, 2)) {
-        timeout_ms = static_cast<int>(lua_tointeger(L, 2));
+    // Slot 2 is a handler only if it is a real function, table or userdata.
+    // lua_isnumber() is not used for that test because it is ALSO true for a
+    // numeric string, and `accept("1000")` must keep meaning what it meant
+    // before (the registered-function form, with the string ignored) instead of
+    // silently becoming a wait.
+    const bool handler_slot = lua_isfunction(L, 2) || lua_istable(L, 2) || lua_isuserdata(L, 2);
+    if (lua_type(L, 2) == LUA_TNUMBER) {
+        // accept(timeout_ms): the async form, with a bounded wait.
+        AcceptTimeoutArg(L, 2, timeout_ms);
         timed = true;
-        lua_settop(L, 1);   // no handler: this is the async form
-    } else if (lua_gettop(L) >= 3 && lua_isnumber(L, 3)) {
-        timeout_ms = static_cast<int>(lua_tointeger(L, 3));
+        lua_settop(L, 1);
+    } else if (lua_gettop(L) >= 3 && lua_type(L, 3) == LUA_TNUMBER) {
+        AcceptTimeoutArg(L, 3, timeout_ms);
         timed = true;
         lua_settop(L, 2);   // [2] = handler, as the pcall below expects
+    } else if (handler_slot) {
+        // The handler form keeps exactly two arguments. A third argument would
+        // sit under the pcall's results, and `lua_gettop(L) > 2` below takes
+        // everything above the socket as the handler's RESPONSE - so a stray
+        // option would be sent to the client as the response body. Refuse it
+        // instead of guessing.
+        if (lua_gettop(L) > 2 && !lua_isnoneornil(L, 3))
+            return luaL_argerror(L, 3, "expected a timeout in milliseconds");
+        lua_settop(L, 2);
     }
     if (timed && timeout_ms != 0 && !s->WaitReadable(timeout_ms < 0 ? -1 : timeout_ms)) {
         lua_pushboolean(L, false);

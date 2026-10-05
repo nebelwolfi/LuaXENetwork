@@ -70,7 +70,11 @@ function Invoke-Script {
     # The verdict is the line the script prints, not the process exit code:
     # with output redirected, a child that exits 0 is not reliably reported as 0
     # here (an earlier version of this runner called a passing suite a failure).
-    $ok = $text -match '(?m)^\s*TB287 RESULT: pass\s*$'
+    # The verdict is the line the script prints, not the process exit code:
+    # with output redirected, a child that exits 0 is not reliably reported as 0
+    # here (an earlier version of this runner called a passing suite a failure).
+    # TB-396's listener matrix prints the same TB287 marker.
+    $ok = $text -match '(?m)^\s*TB(287|396) RESULT: pass\s*$'
     if (-not $ok) { $exitCode = 1 }
     $results.Add([pscustomobject]@{ Name = (Split-Path -Leaf $ScriptPath); Ok = $ok; Seconds = $seconds })
 }
